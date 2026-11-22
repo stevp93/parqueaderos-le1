@@ -97,6 +97,7 @@ function duracion(min) {
 }
 const minutosDesde = (iso) => Math.max(0, Math.ceil((Date.now() - new Date(iso).getTime()) / 60000));
 const consec = (n) => '#' + String(n).padStart(6, '0');
+const plural = (n, uno, varios) => `${Number(n).toLocaleString('es-CO')} ${Number(n) === 1 ? uno : varios}`;
 function estimarValor(v) {
   const t = S.tarifas[v.tipo_vehiculo];
   if (!t) return { horas: 0, valor: 0 };
@@ -331,7 +332,7 @@ function vistaAcceso(mensaje) {
   raiz.replaceChildren(h('main', { class: 'acceso' },
     h('section', { class: 'acceso-marca' },
       h('div', {},
-        h('div', { class: 'acceso-firma' }, logo(36, 'horizontal'), h('span', { class: 'contexto' }, 'Soacha · CO · Est 2026')),
+        h('div', { class: 'acceso-firma' }, logo(46, 'horizontal'), h('span', { class: 'contexto' }, 'Soacha · CO · Est 2026')),
         h('h1', {}, 'Portería digital ', h('em', {}, 'sin efectivo'), ' y con evidencia sellada'),
         h('p', {}, 'Cada ingreso queda con foto y hora del servidor; cada pago llega directo a la cuenta del conjunto.'),
       ),
@@ -598,6 +599,7 @@ function vistaIngreso(c) {
     if (!revisarTorre(torre.value) && (torre.value.length === 2 || n * 10 > ESTRUCTURA.torres)) apto.focus();
   });
   apto.addEventListener('input', () => { soloDigitos(apto, 3); pintarDestino(); });
+  for (const campo of [placa, torre, apto]) campo.addEventListener('input', () => { error.textContent = ''; });
   placa.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); torre.focus(); } });
   torre.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); apto.focus(); } });
   apto.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); registrar.click(); } });
@@ -615,6 +617,7 @@ function vistaIngreso(c) {
   }
   function mostrarFoto(blob) {
     foto = blob;
+    error.textContent = '';
     if (urlFoto) URL.revokeObjectURL(urlFoto);
     urlFoto = URL.createObjectURL(blob);
     imgCaptura.src = urlFoto; imgCaptura.hidden = false;
@@ -1018,12 +1021,12 @@ function vistaTablero(c) {
     const salidasHoy = hoy.filter((f) => f.minutos != null && f.estado !== 'anulado');
     const promedio = salidasHoy.length ? Math.round(salidasHoy.reduce((a, f) => a + f.minutos, 0) / salidasHoy.length) : null;
     kpis.replaceChildren(
-      kpi('Vehículos dentro', r.dentro_total, `${r.dentro_carros} carros · ${r.dentro_motos} motos`, 'lima'),
-      kpi('Permanencia promedio', promedio == null ? '—' : duracion(promedio), `${salidasHoy.length} salidas de visitantes hoy`),
-      kpi('Ingresos hoy', r.ingresos_hoy, `${r.salidas_hoy} salidas`),
+      kpi('Vehículos dentro', r.dentro_total, `${plural(r.dentro_carros, 'carro', 'carros')} · ${plural(r.dentro_motos, 'moto', 'motos')}`, 'lima'),
+      kpi('Tiempo promedio', promedio == null ? '—' : duracion(promedio), promedio == null ? 'Sin salidas hoy' : `De ${plural(salidasHoy.length, 'salida', 'salidas')} de hoy`),
+      kpi('Ingresos hoy', r.ingresos_hoy, plural(r.salidas_hoy, 'salida', 'salidas')),
       kpi('Recaudo hoy', cop(r.recaudo_hoy), 'Pago electrónico aprobado', 'lima'),
       kpi('Cargos a unidades', cop(r.cargado_hoy), 'Hoy · se cobran en administración', r.cargado_hoy ? 'ambar' : ''),
-      kpi('Por cobrar', cop(r.pendiente_total), `${r.pendientes} salidas sin pago`, r.pendientes ? 'rojo' : ''),
+      kpi('Por cobrar', cop(r.pendiente_total), `${plural(r.pendientes, 'salida', 'salidas')} sin pago`, r.pendientes ? 'rojo' : ''),
       kpi('Alertas', r.alerta_permanencia + r.sin_sello, `${r.alerta_permanencia} permanencia alta · ${r.sin_sello} sin sello`, (r.alerta_permanencia + r.sin_sello) ? 'ambar' : ''),
       kpi('Anulados hoy', r.anulados_hoy, 'Con motivo y responsable', r.anulados_hoy ? 'ambar' : ''),
     );
@@ -1043,7 +1046,7 @@ function vistaTablero(c) {
       if (n) barras += `<text x="${x + ancho / 2}" y="${base - alto - 6}" text-anchor="middle" font-family="IBM Plex Mono" font-size="11" fill="#ECEEE9">${n}</text>`;
       if (i % 3 === 0) barras += `<text x="${x + ancho / 2}" y="${base + 18}" text-anchor="middle" font-family="IBM Plex Mono" font-size="11" fill="#8E959B">${String(i).padStart(2, '0')}h</text>`;
     });
-    grafica.replaceChildren(h('div', { class: 'etiqueta' }, 'Ingresos por hora · hoy'), h('h2', { style: { margin: '4px 0 12px' } }, `${hoy.filter((f) => f.estado !== 'anulado').length} ingresos`),
+    grafica.replaceChildren(h('div', { class: 'etiqueta' }, 'Ingresos por hora · hoy'), h('h2', { style: { margin: '4px 0 12px' } }, plural(hoy.filter((f) => f.estado !== 'anulado').length, 'ingreso', 'ingresos')),
       h('div', { html: `<svg class="grafica" viewBox="0 0 ${W} ${H}" role="img" aria-label="Ingresos por hora del día"><line x1="30" x2="${W - 10}" y1="${base}" y2="${base}" stroke="#383E44"/>${barras}</svg>` }));
     alertas.replaceChildren(h('div', { class: 'etiqueta' }, 'Requiere atención'), h('h2', { style: { margin: '4px 0 8px' } }, criticos.length ? `${criticos.length} casos` : 'Sin novedades'),
       criticos.length ? h('div', { class: 'lista-simple' }, criticos.slice(0, 8).map((f) => h('div', {},
