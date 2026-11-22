@@ -5,6 +5,12 @@
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.119.2/+esm';
 import qrcode from 'https://cdn.jsdelivr.net/npm/qrcode-generator@2.0.4/+esm';
 import { CONFIG } from './config.js';
+// La aplicación no se deja mostrar dentro de otra página (protección contra clickjacking)
+if (window.top !== window.self) {
+  document.documentElement.innerHTML = '<body style="font-family:sans-serif;padding:24px">Abra la aplicación directamente en su navegador.</body>';
+  throw new Error('Aplicación cargada dentro de un marco');
+}
+
 
 const sb = createClient(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_KEY, {
   auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false },
@@ -177,8 +183,15 @@ async function llamar(nombre, cuerpo, esFormulario = false) {
     },
     body: esFormulario ? cuerpo : JSON.stringify(cuerpo ?? {}),
   });
-  const d = await r.json().catch(() => ({}));
-  if (!r.ok) throw new ErrorApp(d.error || `Error ${r.status}`, r.status);
+  const d = await r.json().catch(() => null);
+  if (!r.ok) {
+    // Sin respuesta JSON: la solicitud la detuvo el filtro de seguridad del proveedor antes de llegar al servidor
+    if (!d) throw new ErrorApp(r.status === 403
+      ? 'El filtro de seguridad bloqueó la solicitud. Revise los textos escritos (evite símbolos como < > o código) e intente de nuevo.'
+      : `Error ${r.status}`, r.status);
+    throw new ErrorApp(d.error || `Error ${r.status}`, r.status);
+  }
+  if (!d) throw new ErrorApp('Respuesta no válida del servidor', 502);
   return d;
 }
 function revisar({ data, error }) {
@@ -355,7 +368,17 @@ function heroAcceso() {
 // niegan todo mientras la clave esté pendiente; esta pantalla es el único paso posible.
 // ---------------------------------------------------------------------
 const claveVigente = (p) => Boolean(p?.clave_vence_en) && new Date(p.clave_vence_en) > new Date();
-const minimoClave = (rol) => (rol === 'guarda' ? 6 : 8);
+// Requisito para todos los roles: mínimo 8 caracteres con letras y números (alfanumérica).
+const CLAVE_MINIMO = 8;
+const minimoClave = () => CLAVE_MINIMO;
+const REQUISITO_CLAVE = `mínimo ${CLAVE_MINIMO} caracteres, con letras y números`;
+const textoLibre = (v) => String(v ?? '').replace(/[<>]/g, '').replace(/\s+/g, ' ').trim();
+function revisarClave(c) {
+  if (c.length < CLAVE_MINIMO) return `La clave debe tener al menos ${CLAVE_MINIMO} caracteres.`;
+  if (c.length > 72) return 'La clave es demasiado larga (máximo 72 caracteres).';
+  if (!/[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]/.test(c) || !/\d/.test(c)) return 'La clave debe combinar letras y números.';
+  return null;
+}
 function mensajeClave(e) {
   const m = e?.message ?? String(e);
   if (e?.code === 'same_password' || /different from the old/i.test(m)) return 'La nueva clave debe ser distinta de la anterior.';
@@ -363,8 +386,8 @@ function mensajeClave(e) {
   return m;
 }
 async function guardarClaveNueva(rol, nueva, confirma) {
-  const minimo = minimoClave(rol);
-  if (nueva.length < minimo) throw new Error(`La clave debe tener al menos ${minimo} caracteres.`);
+  const problema = revisarClave(nueva);
+  if (problema) throw new Error(problema);
   if (nueva !== confirma) throw new Error('Las claves no coinciden.');
   const { error: e } = await sb.auth.updateUser({ password: nueva });
   if (e) throw new Error(mensajeClave(e));
@@ -388,7 +411,7 @@ function vistaCambioClave(perfil) {
     h('p', { class: 'ayuda', style: { margin: '0 0 18px' } }, primera
       ? `${perfil.nombre}, la clave que le entregaron es temporal. Cámbiela por una que solo usted conozca: se pide una sola vez y después se renueva periódicamente.`
       : `Por seguridad, las claves se renuevan cada ${dias ?? 90} días. La nueva debe ser distinta de la anterior.`),
-    h('div', { class: 'grupo' }, h('label', { for: 'nueva-clave', class: 'etiqueta' }, `Nueva clave (mínimo ${minimo})`), nueva),
+    h('div', { class: 'grupo' }, h('label', { for: 'nueva-clave', class: 'etiqueta' }, 'Nueva clave'), nueva, h('p', { class: 'ayuda', style: { margin: '6px 0 0' } }, `Requisito: ${REQUISITO_CLAVE}.`)),
     h('div', { class: 'grupo' }, h('label', { for: 'confirma-clave', class: 'etiqueta' }, 'Repita la clave'), confirma),
     h('div', { style: { marginTop: '10px' } }, error),
     boton, salir,
@@ -426,7 +449,12 @@ async function iniciarSesion() {
   }
   montarApp();
   const diasRestantes = Math.ceil((new Date(perfil.clave_vence_en) - new Date()) / 86_400_000);
-  if (diasRestantes <= 7) aviso(`Su clave vence en ${plural(diasRestantes, 'día', 'días')}. Puede cambiarla en Mi cuenta.`, 'ok', 8000);
+  if (diasRestantes <= 7) {
+    const cuando = (new Date(perfil.clave_vence_en) - new Date()) < 86_400_000
+      ? `hoy a las ${new Date(perfil.clave_vence_en).toLocaleTimeString('es-CO', { hour: '2-digit', minute: '2-digit' })}`
+      : `en ${plural(diasRestantes, 'día', 'días')}`;
+    aviso(`Su clave vence ${cuando}. Puede cambiarla en Mi cuenta.`, 'ok', 8000);
+  }
   await actualizarCola();
   sincronizarCola();
 }
@@ -532,7 +560,7 @@ function abrirCuenta() {
         h('dt', {}, 'Clave vigente hasta'), h('dd', { class: 'mono' }, fmt.fecha(S.perfil.clave_vence_en)),
       ),
       h('hr', { class: 'sep' }),
-      h('div', { class: 'grupo' }, h('label', { class: 'etiqueta', for: 'nueva' }, `Nueva clave (mínimo ${minimo})`), nueva),
+      h('div', { class: 'grupo' }, h('label', { class: 'etiqueta', for: 'nueva' }, 'Nueva clave'), nueva, h('p', { class: 'ayuda', style: { margin: '6px 0 0' } }, `Requisito: ${REQUISITO_CLAVE}.`)),
       h('div', { class: 'grupo' }, h('label', { class: 'etiqueta', for: 'confirma' }, 'Repita la clave'), confirma),
       error,
     ],
@@ -733,7 +761,7 @@ function vistaIngreso(c) {
     if (!destino.unidad) { error.textContent = destino.error; (destino.campo === 'torre' ? torre : apto).focus(); return; }
     if (!foto) { error.textContent = 'Tome la foto del vehículo antes de registrar.'; return; }
     const campos = {
-      placa: p, tipo_vehiculo: tipo, unidad_id: String(destino.unidad.id), observacion: obs.value.trim(),
+      placa: p, tipo_vehiculo: tipo, unidad_id: String(destino.unidad.id), observacion: textoLibre(obs.value),
       hora_dispositivo: new Date().toISOString(),
     };
     const f = new FormData();
@@ -898,7 +926,7 @@ function anular(v, alTerminar) {
   confirmar.onclick = () => conBoton(confirmar, async () => {
     error.textContent = '';
     if (motivo.value.trim().length < 10) { error.textContent = 'Explique el motivo con al menos 10 caracteres.'; return; }
-    const { error: e } = await sb.from('anulaciones').insert({ ingreso_id: v.id, motivo: motivo.value.trim() });
+    const { error: e } = await sb.from('anulaciones').insert({ ingreso_id: v.id, motivo: textoLibre(motivo.value) });
     if (e) { error.textContent = e.message; return; }
     aviso(`Registro ${consec(v.consecutivo)} anulado`);
     m.cerrar(); alTerminar?.();
@@ -1010,7 +1038,7 @@ function flujoCobro(v, alTerminar) {
     );
     ok.onclick = () => conBoton(ok, async () => {
       if (motivo.value.trim().length < 5) { error.textContent = 'Escriba el motivo.'; return; }
-      const { error: e } = await sb.from('cargos_unidad').insert({ ingreso_id: v.id, motivo: motivo.value.trim() });
+      const { error: e } = await sb.from('cargos_unidad').insert({ ingreso_id: v.id, motivo: textoLibre(motivo.value) });
       if (e) { error.textContent = e.message; return; }
       aviso(`${cop(v.valor)} cargados a ${unidadCod}`);
       m.cerrar();
@@ -1492,7 +1520,7 @@ function ajustesPersonal(z) {
   const rol = h('select', { class: 'campo' }, h('option', { value: 'guarda' }, 'Guarda'), h('option', { value: 'consejo' }, 'Consejo (solo lectura)'),
     S.perfil.rol === 'superadmin' ? h('option', { value: 'admin' }, 'Administración') : null);
   const email = h('input', { class: 'campo', type: 'email', placeholder: 'Opcional' });
-  const clave = h('input', { class: 'campo', type: 'password', autocomplete: 'new-password', placeholder: 'Guardas: 6 dígitos o más' });
+  const clave = h('input', { class: 'campo', type: 'password', autocomplete: 'new-password', placeholder: '8 o más, letras y números' });
   const crear = h('button', { class: 'btn primario' }, 'Crear usuario');
   const error = h('div', { class: 'error-campo' });
   async function cargar() {
