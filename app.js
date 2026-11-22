@@ -47,6 +47,11 @@ function h(tag, props = {}, ...hijos) {
   return e;
 }
 const $ = (sel, raiz = document) => raiz.querySelector(sel);
+// replaceChildren/append ignoran null y false (bloques opcionales), igual que h()
+for (const m of ['replaceChildren', 'append']) {
+  const original = Element.prototype[m];
+  Element.prototype[m] = function (...nodos) { return original.apply(this, nodos.flat(Infinity).filter((x) => x != null && x !== false)); };
+}
 
 const ICONOS = {
   camara: '<path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.6"/>',
@@ -114,7 +119,28 @@ function estimarValor(v) {
 }
 const ETIQ_ESTADO = {
   dentro: ['Dentro', 'azul'], pendiente_pago: ['Por cobrar', 'rojo'], pagado: ['Pagado', 'lima'],
-  cerrado: ['Salió', ''], cargado_unidad: ['Cargado a unidad', 'ambar'], anulado: ['Anulado', 'rojo'],
+  cerrado: ['Salió', ''], sin_pago: ['Salió sin pagar', 'rojo'], cargado_unidad: ['Cargado a unidad (histórico)', 'ambar'],
+  anulado: ['Anulado', 'rojo'],
+};
+// Celular del visitante: 10 dígitos que empiezan por 3 (se acepta el prefijo 57)
+function normalizarCelular(v) {
+  let d = String(v ?? '').replace(/\D/g, '');
+  if (d.length === 12 && d.startsWith('57')) d = d.slice(2);
+  return d;
+}
+const CELULAR = /^3\d{9}$/;
+// Mientras se escribe: quita el prefijo 57 (los celulares colombianos empiezan por 3) y agrupa 3-3-4
+function formatearCelular(campo) {
+  const crudo = campo.value.replace(/\D/g, '');
+  const d = (crudo.startsWith('57') ? crudo.slice(2) : crudo).slice(0, 10);
+  const visible = crudo === '5' || crudo === '57' ? crudo : celularVisible(d);
+  if (visible !== campo.value) campo.value = visible;
+  return d;
+}
+const celularVisible = (d) => d.replace(/^(\d{3})(\d{0,3})(\d{0,4}).*$/, (_, a, b, c) => [a, b, c].filter(Boolean).join(' '));
+const ETIQ_NOTIF = { cobro: 'Enlace de pago', recibo: 'Recibo de pago', deuda: 'Recordatorio de deuda' };
+const ETIQ_NOTIF_ESTADO = {
+  pendiente: ['En cola', 'azul'], enviando: ['Enviando', 'azul'], enviado: ['Enviado', 'lima'], error: ['Falló', 'rojo'], omitido: ['Omitido', ''],
 };
 const chipEstado = (e) => h('span', { class: 'chip ' + (ETIQ_ESTADO[e]?.[1] ?? '') }, ETIQ_ESTADO[e]?.[0] ?? e);
 
@@ -184,6 +210,11 @@ async function llamar(nombre, cuerpo, esFormulario = false) {
     body: esFormulario ? cuerpo : JSON.stringify(cuerpo ?? {}),
   });
   const d = await r.json().catch(() => null);
+  if (r.status === 401 && S.perfil) {
+    // La sesión de este equipo ya no es la activa (se abrió en otro equipo o se entregó el turno)
+    expulsar();
+    throw new ErrorApp(MSG_SESION_CERRADA, 401);
+  }
   if (!r.ok) {
     // Sin respuesta JSON: la solicitud la detuvo el filtro de seguridad del proveedor antes de llegar al servidor
     if (!d) throw new ErrorApp(r.status === 403
@@ -195,8 +226,50 @@ async function llamar(nombre, cuerpo, esFormulario = false) {
   return d;
 }
 function revisar({ data, error }) {
-  if (error) throw new ErrorApp(error.message, error.code);
+  if (error) {
+    if (S.perfil?.rol === 'guarda' && (error.code === '42501' || error.code === 'PGRST301')) verificarSesion();
+    throw new ErrorApp(error.message, error.code);
+  }
   return data;
+}
+
+// ---------------------------------------------------------------------
+// Sesión única del guarda: la base de datos solo deja operar a la sesión registrada al
+// iniciar sesión; si el mismo usuario entra en otro equipo, este queda sin acceso.
+// ---------------------------------------------------------------------
+const MSG_SESION_CERRADA = 'Su sesión en este equipo se cerró: la cuenta se abrió en otro equipo o el turno ya se entregó. Si es usted, ingrese de nuevo.';
+function idEquipo() {
+  try {
+    let id = localStorage.getItem('le1-equipo');
+    if (!id) { id = crypto.randomUUID().slice(0, 8).toUpperCase(); localStorage.setItem('le1-equipo', id); }
+    return id;
+  } catch { return 'SIN-ID'; }
+}
+function descripcionEquipo() {
+  const ua = navigator.userAgent;
+  const so = /Android [\d.]+/.exec(ua)?.[0] ?? (/iPhone|iPad/.test(ua) ? 'iOS' : /Windows/.test(ua) ? 'Windows' : /Mac OS/.test(ua) ? 'macOS' : /Linux/.test(ua) ? 'Linux' : 'Otro');
+  const modelo = /Android [\d.]+; ([^;)]+)/.exec(ua)?.[1]?.trim();
+  return [`Equipo ${idEquipo()}`, so, modelo, `${screen.width}x${screen.height}`].filter(Boolean).join(' · ');
+}
+let expulsando = false;
+async function expulsar(mensaje = MSG_SESION_CERRADA) {
+  if (expulsando) return;
+  expulsando = true;
+  S.motivoSalida = mensaje;
+  detenerVista();
+  clearInterval(S.vigilancia); S.vigilancia = null;
+  try { await sb.auth.signOut({ scope: 'local' }); } catch { /* la sesión ya no existe en el servidor */ }
+  S.perfil = null;
+  for (const v of document.querySelectorAll('.velo, .cajon')) v.remove();
+  vistaAcceso(S.motivoSalida); S.motivoSalida = null;
+  expulsando = false;
+}
+async function verificarSesion() {
+  if (S.perfil?.rol !== 'guarda' || !navigator.onLine) return;
+  const { data, error } = await sb.rpc('estado_turno');
+  if (error) { if (/JWT|session|sesi/i.test(error.message)) expulsar(); return; }
+  if (data && data.sesion_vigente === false) expulsar();
+  else if (data) S.turno = data.turno;
 }
 async function todo(constructor) {
   const salida = [];
@@ -318,11 +391,14 @@ async function actualizarCola() {
 function vistaAcceso(mensaje) {
   detenerVista();
   const raiz = $('#raiz');
-  const error = h('div', { class: 'error-campo', role: 'alert' }, mensaje ?? '');
+  const informativo = typeof mensaje === 'string' && mensaje.startsWith('Turno entregado');
+  const error = h('div', { class: 'error-campo', role: 'alert' }, informativo ? '' : (mensaje ?? ''));
+  const nota = informativo ? h('div', { class: 'banner lima', style: { marginBottom: '16px', wordBreak: 'break-word' } }, mensaje) : null;
   const usuario = h('input', { class: 'campo', id: 'usuario', autocomplete: 'username', placeholder: 'Ej.: G-07 o correo', required: true, autocapitalize: 'characters' });
   const clave = h('input', { class: 'campo', id: 'clave', type: 'password', autocomplete: 'current-password', required: true });
   const boton = h('button', { class: 'btn primario grande bloque', type: 'submit' }, 'Ingresar');
   const form = h('form', { class: 'acceso-caja', novalidate: true },
+    nota,
     h('div', { class: 'etiqueta' }, 'Acceso del personal'),
     h('h2', {}, 'Ingrese a la portería digital'),
     h('div', { class: 'grupo' }, h('label', { for: 'usuario', class: 'etiqueta' }, 'Usuario'), usuario),
@@ -340,6 +416,8 @@ function vistaAcceso(mensaje) {
     await conBoton(boton, async () => {
       const { error: e } = await sb.auth.signInWithPassword({ email, password: clave.value });
       if (e) { error.textContent = /invalid/i.test(e.message) ? 'Usuario o clave incorrectos.' : e.message; return; }
+      // Solo un ingreso con clave registra este equipo como la sesión activa del guarda
+      S.nuevaSesion = true;
       await iniciarSesion();
     });
   });
@@ -436,18 +514,37 @@ async function iniciarSesion() {
   if (!user) return vistaAcceso();
   const { data: perfil } = await sb.from('perfiles').select('id, nombre, codigo, rol, activo, clave_cambiada_en, clave_vence_en').eq('id', user.id).maybeSingle();
   if (!perfil || !perfil.activo) {
-    await sb.auth.signOut();
+    await sb.auth.signOut({ scope: 'local' });
     return vistaAcceso('Su usuario está inactivo o no tiene perfil. Consulte a la administración.');
   }
   S.usuario = user;
   S.perfil = perfil;
   if (!claveVigente(perfil)) return vistaCambioClave(perfil);
+  if (perfil.rol === 'guarda') {
+    const nueva = S.nuevaSesion;
+    S.nuevaSesion = false;
+    const { data: est, error: eT } = nueva
+      ? await sb.rpc('iniciar_sesion_portero', { p_equipo: descripcionEquipo() })
+      : await sb.rpc('estado_turno');
+    if (eT) {
+      await sb.auth.signOut({ scope: 'local' });
+      return vistaAcceso('No se pudo abrir el turno: ' + eT.message);
+    }
+    if (!est?.sesion_vigente) return expulsar();
+    S.turno = est.turno;
+    S.porRecibir = est.por_recibir;
+  }
   try {
     await cargarCatalogos();
   } catch (e) {
     return vistaAcceso('No se pudo cargar la configuración: ' + mensajeError(e));
   }
   montarApp();
+  if (perfil.rol === 'guarda') {
+    clearInterval(S.vigilancia);
+    S.vigilancia = setInterval(verificarSesion, 30000);
+    if (S.porRecibir) recibirTurno(S.porRecibir);
+  }
   const diasRestantes = Math.ceil((new Date(perfil.clave_vence_en) - new Date()) / 86_400_000);
   if (diasRestantes <= 7) {
     const cuando = (new Date(perfil.clave_vence_en) - new Date()) < 86_400_000
@@ -558,14 +655,21 @@ function abrirCuenta() {
         h('dt', {}, 'Código'), h('dd', { class: 'mono' }, S.perfil.codigo),
         h('dt', {}, 'Rol'), h('dd', {}, ROL_NOMBRE[S.perfil.rol]),
         h('dt', {}, 'Clave vigente hasta'), h('dd', { class: 'mono' }, fmt.fecha(S.perfil.clave_vence_en)),
+        S.perfil.rol === 'guarda' ? [
+          h('dt', {}, 'Este equipo'), h('dd', { class: 'mono' }, descripcionEquipo()),
+          h('dt', {}, 'Turno'), h('dd', {}, S.turno ? `Abierto desde ${fmt.fechaHora(S.turno.iniciado_en)}` : 'Sin turno abierto'),
+        ] : null,
       ),
+      S.perfil.rol === 'guarda' ? h('div', { class: 'banner azul', style: { marginTop: '12px' } },
+        'Al terminar su turno use "Entregar turno": queda el acta con los vehículos que siguen dentro y el siguiente guarda la recibe. Si solo cierra sesión, el turno queda abierto y se marcará "sin cierre".') : null,
       h('hr', { class: 'sep' }),
       h('div', { class: 'grupo' }, h('label', { class: 'etiqueta', for: 'nueva' }, 'Nueva clave'), nueva, h('p', { class: 'ayuda', style: { margin: '6px 0 0' } }, `Requisito: ${REQUISITO_CLAVE}.`)),
       h('div', { class: 'grupo' }, h('label', { class: 'etiqueta', for: 'confirma' }, 'Repita la clave'), confirma),
       error,
     ],
     acciones: [
-      h('button', { class: 'btn peligro', onclick: async () => { await sb.auth.signOut(); m.cerrar(); location.hash = ''; vistaAcceso(); } }, icono('salir'), 'Cerrar sesión'),
+      h('button', { class: 'btn peligro', onclick: async () => { clearInterval(S.vigilancia); await sb.auth.signOut(); m.cerrar(); location.hash = ''; vistaAcceso(); } }, icono('salir'), 'Cerrar sesión'),
+      S.perfil.rol === 'guarda' && S.turno ? h('button', { class: 'btn', onclick: () => { m.cerrar(); location.hash = 'turno'; setTimeout(entregarTurno, 50); } }, icono('reloj'), 'Entregar turno') : null,
       guardar,
     ],
   });
@@ -638,6 +742,9 @@ function vistaIngreso(c) {
   const apto = h('input', { class: 'campo destino-campo', id: 'apto', inputmode: 'numeric', maxlength: '3', autocomplete: 'off', placeholder: RANGO_APTOS.replace(' a ', '–'), 'aria-describedby': 'destino-estado' });
   const destinoEstado = h('div', { class: 'destino-estado', id: 'destino-estado', 'aria-live': 'polite' });
   const obs = h('input', { class: 'campo', id: 'obs', maxlength: '200', placeholder: 'Opcional' });
+  const celular = h('input', { class: 'campo mono', id: 'celular', type: 'tel', inputmode: 'numeric', maxlength: '16', autocomplete: 'off', placeholder: '300 123 4567', 'aria-describedby': 'celular-ayuda' });
+  const autoriza = h('input', { type: 'checkbox', id: 'autoriza' });
+  const deuda = h('div', { 'aria-live': 'polite' });
   const error = h('div', { class: 'error-campo', role: 'alert' });
   const registrar = h('button', { class: 'btn primario grande bloque' }, icono('escudo', 20), 'Registrar ingreso');
 
@@ -658,7 +765,38 @@ function vistaIngreso(c) {
     const limpio = placa.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 7);
     if (limpio !== placa.value) placa.value = limpio;
     sugerirTipo();
+    revisarDeuda();
   });
+
+  // Deuda de la placa: salidas anteriores sin pagar. Se avisa al guarda para cobrarla al llegar.
+  let tDeuda = null; let deudaConsultada = '';
+  function revisarDeuda() {
+    clearTimeout(tDeuda);
+    const p = placa.value;
+    if (!PLACA.test(p)) { deuda.replaceChildren(); deudaConsultada = ''; return; }
+    tDeuda = setTimeout(async () => {
+      if (p === deudaConsultada || !navigator.onLine) return;
+      deudaConsultada = p;
+      const { data } = await sb.rpc('deuda_placa', { p_placa: p });
+      if (placa.value !== p) return;
+      if (!data || !data.total) { deuda.replaceChildren(); return; }
+      const items = data.items;
+      deuda.replaceChildren(h('div', { class: 'banner rojo deuda-placa' },
+        h('div', {}, h('b', {}, `${p} tiene una deuda de ${cop(data.total)}`),
+          h('div', { class: 'ayuda', style: { color: 'inherit', marginTop: '4px' } },
+            `${plural(items.length, 'salida', 'salidas')} sin pagar: ${items.map((x) => `${consec(x.consecutivo)} del ${fmt.fecha(x.hora_salida)} (${cop(x.valor)})`).join(', ')}. Solicite el pago antes de permitir el ingreso.`)),
+        h('div', { class: 'fila', style: { marginTop: '10px' } }, items.map((x) => h('button', {
+          class: 'btn chico', type: 'button',
+          onclick: () => flujoCobro({ ...x, estado: x.estado }, () => { deudaConsultada = ''; revisarDeuda(); }),
+        }, `Cobrar ${consec(x.consecutivo)} · ${cop(x.valor)}`)))));
+    }, 450);
+  }
+  celular.addEventListener('input', () => {
+    const d = formatearCelular(celular);
+    celular.toggleAttribute('aria-invalid', d.length === 10 && !CELULAR.test(d));
+    error.textContent = '';
+  });
+  autoriza.addEventListener('change', () => { error.textContent = ''; });
 
   // Destino: validación mientras se escribe; nunca acepta una torre o un apartamento fuera del conjunto.
   function pintarDestino() {
@@ -697,7 +835,8 @@ function vistaIngreso(c) {
   for (const campo of [placa, torre, apto]) campo.addEventListener('input', () => { error.textContent = ''; });
   placa.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); torre.focus(); } });
   torre.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); apto.focus(); } });
-  apto.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); registrar.click(); } });
+  apto.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); celular.focus(); } });
+  celular.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); autoriza.focus(); } });
 
   async function encender() {
     vacioCam.hidden = true; video.hidden = false; estadoCam.hidden = false;
@@ -748,6 +887,7 @@ function vistaIngreso(c) {
 
   function reiniciar() {
     placa.value = ''; torre.value = ''; apto.value = ''; obs.value = ''; error.textContent = '';
+    celular.value = ''; autoriza.checked = false; celular.removeAttribute('aria-invalid'); deuda.replaceChildren(); deudaConsultada = '';
     tipoManual = false; fijarTipo('carro'); pintarDestino();
     btnRepetir.onclick();
     placa.focus();
@@ -759,10 +899,13 @@ function vistaIngreso(c) {
     if (!PLACA.test(p)) { error.textContent = 'Escriba una placa válida (5 a 7 letras y números).'; placa.focus(); return; }
     const destino = resolverDestino(torre.value, apto.value);
     if (!destino.unidad) { error.textContent = destino.error; (destino.campo === 'torre' ? torre : apto).focus(); return; }
+    const cel = normalizarCelular(celular.value);
+    if (!CELULAR.test(cel)) { error.textContent = 'Escriba el celular del visitante: 10 dígitos que empiezan por 3. Allí se le envía el recibo.'; celular.focus(); return; }
+    if (!autoriza.checked) { error.textContent = 'Confirme que el visitante autoriza recibir el recibo por WhatsApp.'; autoriza.focus(); return; }
     if (!foto) { error.textContent = 'Tome la foto del vehículo antes de registrar.'; return; }
     const campos = {
       placa: p, tipo_vehiculo: tipo, unidad_id: String(destino.unidad.id), observacion: textoLibre(obs.value),
-      hora_dispositivo: new Date().toISOString(),
+      celular: cel, autoriza_datos: 'true', hora_dispositivo: new Date().toISOString(),
     };
     const f = new FormData();
     for (const [k, v] of Object.entries(campos)) f.append(k, v);
@@ -790,13 +933,17 @@ function vistaIngreso(c) {
     h('div', { class: 'ingreso' },
       h('section', {}, camara, h('div', { class: 'camara-acciones' }, btnFoto, btnRepetir)),
       h('section', { class: 'panel relleno' },
-        h('div', { class: 'grupo' }, h('label', { class: 'etiqueta', for: 'placa' }, 'Placa'), placa),
+        h('div', { class: 'grupo' }, h('label', { class: 'etiqueta', for: 'placa' }, 'Placa'), placa, deuda),
         h('div', { class: 'grupo' }, h('span', { class: 'etiqueta' }, 'Tipo de vehículo'), h('div', { class: 'seg', role: 'group', 'aria-label': 'Tipo de vehículo' }, bCarro, bMoto)),
         h('div', { class: 'grupo' }, h('span', { class: 'etiqueta' }, 'Apartamento de destino'),
           h('div', { class: 'destino' },
             h('label', { class: 'destino-parte', for: 'torre' }, h('span', {}, 'Torre'), torre),
             h('label', { class: 'destino-parte', for: 'apto' }, h('span', {}, 'Apto'), apto)),
           destinoEstado),
+        h('div', { class: 'grupo' }, h('label', { class: 'etiqueta', for: 'celular' }, 'Celular del visitante (WhatsApp)'), celular,
+          h('p', { class: 'ayuda', id: 'celular-ayuda', style: { margin: '6px 0 0' } }, 'Obligatorio: allí recibe el enlace de pago y el recibo. El personal solo ve los cuatro últimos dígitos.')),
+        h('label', { class: 'casilla', for: 'autoriza' }, autoriza,
+          h('span', {}, 'El visitante autoriza el uso de su celular para enviarle el recibo y avisos de este parqueadero por WhatsApp (Ley 1581 de 2012).')),
         h('div', { class: 'grupo' }, h('label', { class: 'etiqueta', for: 'obs' }, 'Observación'), obs),
         h('div', { style: { marginTop: '10px' } }, error),
         registrar,
@@ -823,6 +970,7 @@ function mostrarResultado(ing, alNuevo) {
           h('dt', {}, 'Hora'), h('dd', {}, fmt.completa(ing.hora_ingreso)),
           h('dt', {}, 'Tipo'), h('dd', {}, ing.tipo_vehiculo),
           h('dt', {}, 'Destino'), h('dd', { class: 'mono' }, unidadCodigo),
+          ing.celular_final ? [h('dt', {}, 'WhatsApp'), h('dd', { class: 'mono' }, `••• ••• ${ing.celular_final}`)] : null,
           h('dt', {}, 'Guarda'), h('dd', { class: 'mono' }, S.perfil.codigo),
           h('dt', {}, 'Huella'), h('dd', { class: 'huella' }, ing.registro_sha256),
         ),
@@ -844,14 +992,17 @@ function vistaDentro(c) {
   const rejilla = h('div', { class: 'rejilla-tarjetas' });
   const rejillaCobro = h('div', { class: 'rejilla-tarjetas' });
   const subCobro = h('div', { class: 'subtitulo', hidden: true }, h('h2', {}, 'Salidas por cobrar'), h('span', { class: 'chip rojo', id: 'n-cobro' }, '0'));
+  const rejillaDeuda = h('div', { class: 'rejilla-tarjetas' });
+  const subDeuda = h('div', { class: 'subtitulo', hidden: true }, h('h2', {}, 'Salieron sin pagar (deuda de la placa)'), h('span', { class: 'chip rojo', id: 'n-deuda' }, '0'));
   let datos = [];
 
   function tarjeta(v) {
     const min = minutosDesde(v.hora_ingreso);
-    const est = v.estado === 'pendiente_pago' ? { valor: v.valor } : estimarValor(v);
+    const salio = v.estado === 'pendiente_pago' || v.estado === 'sin_pago';
+    const est = salio ? { valor: v.valor } : estimarValor(v);
     const alerta = v.estado === 'dentro' && min > S.cfg.alerta_permanencia_min;
     const puedeAnular = v.estado === 'dentro' && (esAdmin() || (v.guarda_ingreso_id === S.perfil.id && min <= S.cfg.anulacion_guarda_min));
-    return h('article', { class: 'tarjeta' + (alerta ? ' alerta' : '') + (v.estado === 'pendiente_pago' ? ' cobro' : '') },
+    return h('article', { class: 'tarjeta' + (alerta ? ' alerta' : '') + (salio ? ' cobro' : '') },
       h('div', { class: 'tarjeta-cabeza' },
         h('span', { class: 'placa-mini' }, v.placa),
         h('span', { class: 'mono mudo' }, consec(v.consecutivo))),
@@ -861,13 +1012,13 @@ function vistaDentro(c) {
         alerta ? h('span', { class: 'chip ambar' }, 'Permanencia alta') : null),
       h('div', { class: 'tarjeta-datos' },
         h('div', {}, h('div', { class: 'etiqueta' }, 'Entrada'), h('div', { class: 'v' }, fmt.hora(v.hora_ingreso)), h('div', { class: 'ayuda' }, duracion(min))),
-        h('div', {}, h('div', { class: 'etiqueta' }, v.estado === 'pendiente_pago' ? 'Por cobrar' : 'Valor actual'),
+        h('div', {}, h('div', { class: 'etiqueta' }, v.estado === 'sin_pago' ? 'Deuda' : v.estado === 'pendiente_pago' ? 'Por cobrar' : 'Valor actual'),
           h('div', { class: 'v' }, cop(est.valor)),
-          h('div', { class: 'ayuda' }, v.estado === 'pendiente_pago' ? `Salió ${fmt.hora(v.hora_salida)}` : `${est.horas} h × ${cop(S.tarifas[v.tipo_vehiculo]?.valor_hora)}`)),
+          h('div', { class: 'ayuda' }, salio ? `Salió ${v.estado === 'sin_pago' ? fmt.fechaHora(v.hora_salida) : fmt.hora(v.hora_salida)}` : `${est.horas} h × ${cop(S.tarifas[v.tipo_vehiculo]?.valor_hora)}`)),
       ),
       h('div', { class: 'tarjeta-acciones' },
-        v.estado === 'pendiente_pago'
-          ? h('button', { class: 'btn primario', onclick: () => flujoCobro(v, cargar) }, 'Cobrar')
+        salio
+          ? h('button', { class: 'btn primario', onclick: () => flujoCobro(v, cargar) }, v.estado === 'sin_pago' ? 'Cobrar deuda' : 'Cobrar')
           : h('button', { class: 'btn primario', onclick: () => flujoSalida(v, cargar) }, 'Registrar salida'),
         v.tiene_foto ? h('button', { class: 'btn chico fantasma', onclick: () => verFoto(v), 'aria-label': `Ver foto de ${v.placa}` }, icono('foto')) : null,
         puedeAnular ? h('button', { class: 'btn chico peligro', onclick: () => anular(v, cargar) }, 'Anular') : null,
@@ -884,18 +1035,22 @@ function vistaDentro(c) {
     subCobro.hidden = !cobro.length;
     const n = $('#n-cobro', subCobro); if (n) n.textContent = String(cobro.length);
     rejillaCobro.replaceChildren(...cobro.map(tarjeta));
+    const deudas = datos.filter((v) => v.estado === 'sin_pago' && filtro(v));
+    subDeuda.hidden = !deudas.length;
+    const nd = $('#n-deuda', subDeuda); if (nd) nd.textContent = String(deudas.length);
+    rejillaDeuda.replaceChildren(...deudas.slice(0, 60).map(tarjeta));
   }
   async function cargar() {
     try {
       datos = revisar(await sb.from('v_ingresos')
-        .select('id, consecutivo, placa, tipo_vehiculo, unidad_id, unidad_codigo, hora_ingreso, hora_salida, valor, estado, tiene_foto, guarda_ingreso_id')
-        .in('estado', ['dentro', 'pendiente_pago']).order('hora_ingreso', { ascending: false }).limit(800));
+        .select('id, consecutivo, placa, tipo_vehiculo, unidad_id, unidad_codigo, hora_ingreso, hora_salida, valor, horas_cobradas, tarifa_hora, estado, tiene_foto, guarda_ingreso_id')
+        .in('estado', ['dentro', 'pendiente_pago', 'sin_pago']).order('hora_ingreso', { ascending: false }).limit(800));
       pintar();
     } catch (e) { aviso(mensajeError(e), 'error'); }
   }
   buscar.addEventListener('input', pintar);
   recargar.onclick = () => conBoton(recargar, cargar);
-  c.append(cabecera('Portería · operación', 'Vehículos dentro', total, buscar, recargar), rejilla, subCobro, rejillaCobro);
+  c.append(cabecera('Portería · operación', 'Vehículos dentro', total, buscar, recargar), rejilla, subCobro, rejillaCobro, subDeuda, rejillaDeuda);
   rejilla.append(h('div', { class: 'vacio-lista' }, h('span', { class: 'cargando' })));
   cargar();
   const intervalo = setInterval(cargar, 20000);
@@ -961,22 +1116,24 @@ function flujoSalida(v, alTerminar) {
 function flujoCobro(v, alTerminar) {
   let sondeo = null; let reloj = null; let pagoActual = null;
   const cuerpo = h('div');
-  const m = modal({ titulo: `Cobro · ${v.placa}`, cuerpo, ancho: '640px', alCerrar: () => { clearInterval(sondeo); clearInterval(reloj); alTerminar?.(); } });
+  const m = modal({ titulo: `${v.estado === 'sin_pago' ? 'Cobro de deuda' : 'Cobro'} · ${v.placa}`, cuerpo, ancho: '640px', alCerrar: () => { clearInterval(sondeo); clearInterval(reloj); alTerminar?.(); } });
 
+  const esDeuda = v.estado === 'sin_pago';
   function pantallaInicial() {
     clearInterval(sondeo); clearInterval(reloj);
-    const unidadCod = v.unidad_codigo ?? S.unidadPorId.get(v.unidad_id)?.codigo;
     const qrBtn = h('button', { class: 'btn primario grande' }, 'Generar QR de pago');
-    const cargoBtn = S.cfg.permitir_cargo_unidad ? h('button', { class: 'btn grande' }, `Cargar a ${unidadCod ?? 'la unidad'}`) : null;
+    const sinPagoBtn = esDeuda ? null : h('button', { class: 'btn peligro' }, 'Se fue sin pagar');
     cuerpo.replaceChildren(
+      esDeuda ? h('div', { class: 'banner rojo', style: { marginBottom: '14px' } },
+        `Deuda pendiente: salida ${consec(v.consecutivo)}${v.hora_salida ? ' del ' + fmt.fechaHora(v.hora_salida) : ''}.`) : null,
       h('div', { class: 'etiqueta' }, 'Valor a pagar'),
       h('div', { class: 'monto', style: { margin: '6px 0 4px' } }, cop(v.valor)),
       h('div', { class: 'ayuda' }, v.horas_cobradas ? `${v.horas_cobradas} h × ${cop(v.tarifa_hora)} · hora o fracción` : 'Hora o fracción'),
-      h('div', { class: 'banner azul', style: { margin: '16px 0' } }, 'El visitante paga desde su celular. El dinero llega directo a la cuenta del conjunto; la portería no recibe efectivo.'),
-      h('div', { class: 'fila' }, qrBtn, cargoBtn),
+      h('div', { class: 'banner azul', style: { margin: '16px 0' } }, 'El visitante paga desde su celular: el enlace también le llega por WhatsApp. El dinero va directo a la cuenta del conjunto; la portería no recibe efectivo.'),
+      h('div', { class: 'fila' }, qrBtn, sinPagoBtn),
     );
     qrBtn.onclick = () => conBoton(qrBtn, generarQR);
-    if (cargoBtn) cargoBtn.onclick = () => pantallaCargo(unidadCod);
+    if (sinPagoBtn) sinPagoBtn.onclick = pantallaSinPago;
   }
 
   async function generarQR() {
@@ -1017,8 +1174,9 @@ function flujoCobro(v, alTerminar) {
   function pantallaExito(metodo) {
     cuerpo.replaceChildren(h('div', { class: 'exito' },
       h('div', { class: 'icono' }, icono('check', 40)),
-      h('h3', {}, 'Pago aprobado · salida autorizada'),
+      h('h3', {}, esDeuda ? 'Deuda pagada' : 'Pago aprobado · salida autorizada'),
       h('p', { class: 'mudo' }, `${cop(pagoActual.monto)} recibidos${metodo ? ' por ' + metodo : ''} · Ref. ${pagoActual.referencia}`),
+      h('p', { class: 'ayuda' }, 'El recibo con la hora de entrada, la de salida y el tiempo se envía al WhatsApp del visitante.'),
       h('button', { class: 'btn primario grande', style: { marginTop: '10px' }, onclick: () => m.cerrar() }, 'Listo')));
   }
   function pantallaFallo(texto) {
@@ -1027,20 +1185,24 @@ function flujoCobro(v, alTerminar) {
         h('button', { class: 'btn primario', onclick: (ev) => conBoton(ev.currentTarget, generarQR) }, 'Generar QR nuevo'),
         h('button', { class: 'btn', onclick: pantallaInicial }, 'Volver')));
   }
-  function pantallaCargo(unidadCod) {
-    const motivo = h('textarea', { class: 'campo', id: 'motivo-cargo', maxlength: '300', placeholder: 'Ej.: el visitante no tiene medio de pago electrónico' });
+  // El visitante se niega a pagar o se va: la salida queda como deuda de la placa (no de la unidad)
+  function pantallaSinPago() {
+    clearInterval(sondeo); clearInterval(reloj);
+    const motivo = h('textarea', { class: 'campo', id: 'motivo-sin-pago', maxlength: '300', placeholder: 'Ej.: el visitante se negó a pagar y salió' });
     const error = h('div', { class: 'error-campo' });
-    const ok = h('button', { class: 'btn primario' }, `Cargar ${cop(v.valor)} a ${unidadCod}`);
+    const ok = h('button', { class: 'btn peligro' }, `Registrar salida sin pago · ${cop(v.valor)}`);
     cuerpo.replaceChildren(
-      h('div', { class: 'banner ambar' }, 'El valor se suma a la cuenta de la unidad visitada y lo cobra la administración. No se recibe efectivo.'),
-      h('div', { class: 'grupo', style: { marginTop: '14px' } }, h('label', { class: 'etiqueta', for: 'motivo-cargo' }, 'Motivo'), motivo), error,
+      h('div', { class: 'banner ambar' }, `El valor queda como deuda de la placa ${v.placa}. El visitante recibe por WhatsApp un enlace para pagar y, si vuelve, la portería verá la alerta al registrar su ingreso. No se carga al apartamento.`),
+      h('div', { class: 'grupo', style: { marginTop: '14px' } }, h('label', { class: 'etiqueta', for: 'motivo-sin-pago' }, 'Qué pasó (mínimo 5 caracteres)'), motivo), error,
       h('div', { class: 'fila', style: { marginTop: '14px' } }, ok, h('button', { class: 'btn', onclick: pantallaInicial }, 'Volver')),
     );
+    motivo.focus();
     ok.onclick = () => conBoton(ok, async () => {
-      if (motivo.value.trim().length < 5) { error.textContent = 'Escriba el motivo.'; return; }
-      const { error: e } = await sb.from('cargos_unidad').insert({ ingreso_id: v.id, motivo: textoLibre(motivo.value) });
+      const texto = textoLibre(motivo.value);
+      if (texto.length < 5) { error.textContent = 'Describa lo ocurrido.'; return; }
+      const { error: e } = await sb.from('salidas_sin_pago').insert({ ingreso_id: v.id, motivo: texto });
       if (e) { error.textContent = e.message; return; }
-      aviso(`${cop(v.valor)} cargados a ${unidadCod}`);
+      aviso(`${v.placa}: salida sin pago registrada. Queda una deuda de ${cop(v.valor)}.`, 'alerta', 7000);
       m.cerrar();
     });
   }
@@ -1051,23 +1213,120 @@ function flujoCobro(v, alTerminar) {
 // Vista: turno del guarda
 // ---------------------------------------------------------------------
 function vistaTurno(c) {
-  const kpis = h('div', { class: 'kpis' });
+  const kpis = h('div', { class: 'kpis' }, h('div', { class: 'vacio-lista' }, h('span', { class: 'cargando' })));
+  const dentro = h('div');
   const tabla = h('div');
-  c.append(cabecera('Portería · resumen', `Mi turno · ${S.perfil.codigo}`), kpis, h('div', { class: 'subtitulo' }, h('h2', {}, 'Mis registros de hoy')), tabla);
-  (async () => {
-    const [desde] = rangoDia(hoyLocal());
+  const entregar = h('button', { class: 'btn primario' }, icono('reloj'), 'Entregar turno');
+  entregar.onclick = entregarTurno;
+  const pendiente = h('div');
+  c.append(cabecera('Portería · turno', `Mi turno · ${S.perfil.codigo}`, entregar), pendiente, kpis,
+    h('div', { class: 'subtitulo' }, h('h2', {}, 'Vehículos dentro (quedan en el acta)')), dentro,
+    h('div', { class: 'subtitulo' }, h('h2', {}, 'Mis registros del turno')), tabla);
+  async function cargar() {
+    const acta = revisar(await sb.rpc('vista_previa_acta'));
+    if (S.porRecibir) {
+      pendiente.replaceChildren(h('div', { class: 'banner ambar', style: { marginBottom: '16px' } },
+        'Tiene pendiente recibir el turno anterior. ', h('button', { class: 'btn chico', onclick: () => recibirTurno(S.porRecibir) }, 'Revisar y recibir')));
+    } else pendiente.replaceChildren();
+    kpis.replaceChildren(
+      kpi('Turno desde', fmt.hora(acta.desde), fmt.fecha(acta.desde)),
+      kpi('Ingresos', acta.ingresos, 'Registrados por usted', 'lima'),
+      kpi('Salidas', acta.salidas, 'Registradas por usted'),
+      kpi('Recaudo', cop(acta.recaudo), 'Directo a la cuenta del conjunto', 'lima'),
+      kpi('Dentro ahora', acta.vehiculos_dentro.length, 'Pasan al siguiente turno'),
+      kpi('Por cobrar', acta.por_cobrar.length, cop(acta.por_cobrar.reduce((x, y) => x + y.valor, 0)), acta.por_cobrar.length ? 'rojo' : ''),
+      kpi('Salieron sin pagar', acta.sin_pago.length, cop(acta.sin_pago.reduce((x, y) => x + y.valor, 0)), acta.sin_pago.length ? 'rojo' : ''),
+    );
+    dentro.replaceChildren(listaActa(acta.vehiculos_dentro));
     const filas = revisar(await sb.from('v_ingresos')
       .select('id, consecutivo, placa, tipo_vehiculo, unidad_codigo, hora_ingreso, estado, valor, pago_monto')
-      .eq('guarda_ingreso_id', S.perfil.id).gte('hora_ingreso', desde).order('hora_ingreso', { ascending: false }).limit(200));
-    const pagado = filas.filter((f) => f.estado === 'pagado').reduce((a, f) => a + (f.pago_monto ?? 0), 0);
-    kpis.replaceChildren(
-      kpi('Ingresos registrados', filas.filter((f) => f.estado !== 'anulado').length, 'Hoy, por usted', 'lima'),
-      kpi('Siguen dentro', filas.filter((f) => f.estado === 'dentro').length, 'De sus registros'),
-      kpi('Recaudo', cop(pagado), 'Directo a la cuenta del conjunto', 'lima'),
-      kpi('Anulados', filas.filter((f) => f.estado === 'anulado').length, 'Con motivo registrado', filas.some((f) => f.estado === 'anulado') ? 'ambar' : ''),
-    );
+      .eq('guarda_ingreso_id', S.perfil.id).gte('hora_ingreso', acta.desde).order('hora_ingreso', { ascending: false }).limit(300));
     tabla.replaceChildren(tablaIngresos(filas, false));
-  })().catch((e) => aviso(mensajeError(e), 'error'));
+  }
+  cargar().catch((e) => aviso(mensajeError(e), 'error'));
+  const t = setInterval(() => cargar().catch(() => {}), 30000);
+  return () => clearInterval(t);
+}
+
+function listaActa(vehiculos) {
+  if (!vehiculos?.length) return h('div', { class: 'vacio-lista' }, 'No hay vehículos dentro.');
+  return h('div', { class: 'tabla-caja' }, h('table', { class: 'tabla', style: { minWidth: '480px' } },
+    h('thead', {}, h('tr', {}, ['#', 'Placa', 'Tipo', 'Destino', 'Ingreso'].map((t) => h('th', {}, t)))),
+    h('tbody', {}, vehiculos.map((x) => h('tr', { style: { cursor: 'default' } },
+      h('td', { class: 'mono mudo' }, consec(x.consecutivo)), h('td', { class: 'placa-celda' }, x.placa),
+      h('td', {}, x.tipo), h('td', { class: 'mono' }, x.destino ?? '—'), h('td', { class: 'mono' }, fmt.fechaHora(x.ingreso)))))));
+}
+
+// Resumen del acta (para entregar, recibir o auditar un turno)
+function cuerpoActa(acta, extra = {}) {
+  const sinPagoTotal = (acta.sin_pago ?? []).reduce((x, y) => x + y.valor, 0);
+  const porCobrarTotal = (acta.por_cobrar ?? []).reduce((x, y) => x + y.valor, 0);
+  return [
+    h('dl', { class: 'dato-lista' },
+      h('dt', {}, 'Guarda'), h('dd', {}, `${acta.guarda?.codigo ?? ''} · ${acta.guarda?.nombre ?? ''}`),
+      h('dt', {}, 'Desde'), h('dd', {}, fmt.completa(acta.desde)),
+      h('dt', {}, 'Hasta'), h('dd', {}, fmt.completa(acta.hasta)),
+      extra.estado ? [h('dt', {}, 'Cierre'), h('dd', {}, extra.estado === 'sin_cierre'
+        ? h('span', { class: 'chip rojo' }, 'Sin cierre: el guarda no entregó') : h('span', { class: 'chip lima' }, 'Entregado por el guarda'))] : null,
+      h('dt', {}, 'Movimientos'), h('dd', {}, `${plural(acta.ingresos, 'ingreso', 'ingresos')} · ${plural(acta.salidas, 'salida', 'salidas')} · ${plural(acta.anulados, 'anulación', 'anulaciones')}`),
+      h('dt', {}, 'Recaudo'), h('dd', { class: 'mono' }, cop(acta.recaudo)),
+      acta.por_cobrar?.length ? [h('dt', {}, 'Por cobrar'), h('dd', {}, `${acta.por_cobrar.map((x) => x.placa).join(', ')} · ${cop(porCobrarTotal)}`)] : null,
+      acta.sin_pago?.length ? [h('dt', {}, 'Sin pago'), h('dd', {}, `${acta.sin_pago.map((x) => x.placa).join(', ')} · ${cop(sinPagoTotal)}`)] : null,
+      extra.observacion ? [h('dt', {}, 'Observación'), h('dd', {}, extra.observacion)] : null,
+      extra.huella ? [h('dt', {}, 'Huella del acta'), h('dd', { class: 'huella' }, extra.huella)] : null,
+    ),
+    h('div', { class: 'subtitulo', style: { marginTop: '16px' } }, h('h2', {}, 'Vehículos dentro'), h('span', { class: 'chip azul' }, String(acta.vehiculos_dentro?.length ?? 0))),
+    listaActa(acta.vehiculos_dentro),
+  ];
+}
+
+async function entregarTurno() {
+  let acta;
+  try { acta = revisar(await sb.rpc('vista_previa_acta')); } catch (e) { aviso(mensajeError(e), 'error'); return; }
+  const obs = h('textarea', { class: 'campo', id: 'obs-entrega', maxlength: '300', placeholder: 'Novedades para el siguiente guarda (opcional)' });
+  const confirmar = h('button', { class: 'btn primario' }, 'Entregar y cerrar sesión');
+  const m = modal({
+    titulo: 'Entregar turno', ancho: '760px',
+    cuerpo: [
+      h('div', { class: 'banner azul', style: { marginBottom: '14px' } },
+        'Revise que los vehículos de la lista sigan en el parqueadero. Al entregar se cierra el acta con su huella y su sesión; el siguiente guarda la recibe al ingresar.'),
+      acta.por_cobrar.length ? h('div', { class: 'banner rojo', style: { marginBottom: '14px' } },
+        `Hay ${plural(acta.por_cobrar.length, 'salida', 'salidas')} por cobrar (${acta.por_cobrar.map((x) => x.placa).join(', ')}). Cóbrelas o regístrelas como "se fue sin pagar" antes de entregar.`) : null,
+      ...cuerpoActa(acta),
+      h('div', { class: 'grupo', style: { marginTop: '16px' } }, h('label', { class: 'etiqueta', for: 'obs-entrega' }, 'Observación de entrega'), obs),
+    ],
+    acciones: [h('button', { class: 'btn', onclick: () => m.cerrar() }, 'Cancelar'), confirmar],
+  });
+  confirmar.onclick = () => conBoton(confirmar, async () => {
+    let r;
+    try { r = revisar(await sb.rpc('entregar_turno', { p_observacion: textoLibre(obs.value) || null })); } catch (e) { aviso(mensajeError(e), 'error'); return; }
+    m.cerrar();
+    expulsar(`Turno entregado a las ${fmt.horaSeg(r.cerrado_en)} con ${plural(r.acta.vehiculos_dentro.length, 'vehículo', 'vehículos')} dentro. Huella del acta: ${r.acta_sha256.slice(0, 16)}…`);
+  });
+}
+
+function recibirTurno(t) {
+  const obs = h('textarea', { class: 'campo', id: 'obs-recibo', maxlength: '300', placeholder: 'Ej.: falta el vehículo ABC123 de la lista (opcional)' });
+  const recibir = h('button', { class: 'btn primario' }, icono('check'), 'Recibo el turno');
+  const m = modal({
+    titulo: 'Recibir turno', ancho: '760px',
+    cuerpo: [
+      h('div', { class: 'banner ' + (t.estado === 'sin_cierre' ? 'rojo' : 'azul'), style: { marginBottom: '14px' } },
+        t.estado === 'sin_cierre'
+          ? 'El guarda anterior no entregó el turno: el sistema lo cerró al abrir el suyo. Confirme físicamente los vehículos de la lista y anote cualquier diferencia.'
+          : 'Confirme físicamente que los vehículos de la lista están en el parqueadero. Desde este momento quedan bajo su turno.'),
+      ...cuerpoActa(t.acta, { estado: t.estado, observacion: t.observacion_entrega, huella: t.acta_sha256 }),
+      h('div', { class: 'grupo', style: { marginTop: '16px' } }, h('label', { class: 'etiqueta', for: 'obs-recibo' }, 'Observación de recibo'), obs),
+    ],
+    acciones: [h('button', { class: 'btn', onclick: () => m.cerrar() }, 'Más tarde'), recibir],
+  });
+  recibir.onclick = () => conBoton(recibir, async () => {
+    try { revisar(await sb.rpc('recibir_turno', { p_turno: t.id, p_observacion: textoLibre(obs.value) || null })); } catch (e) { aviso(mensajeError(e), 'error'); return; }
+    S.porRecibir = null;
+    aviso('Turno recibido. Queda constancia en la bitácora.');
+    m.cerrar();
+    if (S.vista === 'turno') irA('turno');
+  });
 }
 
 function kpi(etiqueta, valor, detalle, tono = '') {
@@ -1098,10 +1357,12 @@ function vistaTablero(c) {
   const grafica = h('div', { class: 'panel relleno' });
   const alertas = h('div', { class: 'panel relleno' });
   const ultimos = h('div');
+  const turnos = h('div');
   const recargar = h('button', { class: 'btn' }, icono('recargar'), 'Actualizar');
   c.append(cabecera('Administración · hoy', S.cfg.nombre_conjunto, recargar), kpis,
     h('div', { class: 'dos-columnas' }, grafica, alertas),
-    h('div', { class: 'subtitulo' }, h('h2', {}, 'Últimos movimientos')), ultimos);
+    h('div', { class: 'subtitulo' }, h('h2', {}, 'Últimos movimientos')), ultimos,
+    h('div', { class: 'subtitulo' }, h('h2', {}, 'Turnos de portería')), turnos);
 
   async function cargar() {
     const [desde] = rangoDia(hoyLocal());
@@ -1120,8 +1381,11 @@ function vistaTablero(c) {
       kpi('Tiempo promedio', promedio == null ? '—' : duracion(promedio), promedio == null ? 'Sin salidas hoy' : `De ${plural(salidasHoy.length, 'salida', 'salidas')} de hoy`),
       kpi('Ingresos hoy', r.ingresos_hoy, plural(r.salidas_hoy, 'salida', 'salidas')),
       kpi('Recaudo hoy', cop(r.recaudo_hoy), 'Pago electrónico aprobado', 'lima'),
-      kpi('Cargos a unidades', cop(r.cargado_hoy), 'Hoy · se cobran en administración', r.cargado_hoy ? 'ambar' : ''),
-      kpi('Por cobrar', cop(r.pendiente_total), `${plural(r.pendientes, 'salida', 'salidas')} sin pago`, r.pendientes ? 'rojo' : ''),
+      kpi('Por cobrar', cop(r.pendiente_total), `${plural(r.pendientes, 'salida', 'salidas')} esperando pago`, r.pendientes ? 'rojo' : ''),
+      kpi('Deuda por placa', cop(r.deuda_total), `${plural(r.deudas, 'salida', 'salidas')} sin pagar`, r.deudas ? 'rojo' : ''),
+      kpi('Turno actual', r.turno ? r.turno.guarda : '—', r.turno ? `${r.turno.nombre} · desde ${fmt.hora(r.turno.desde)}` : 'Ningún guarda en turno', r.turno ? 'lima' : 'ambar'),
+      kpi('Turnos sin cierre', r.turnos_sin_cierre, 'Últimos 7 días', r.turnos_sin_cierre ? 'ambar' : ''),
+      kpi('WhatsApp sin enviar', r.whatsapp_fallidos, 'Último día · ver Ajustes', r.whatsapp_fallidos ? 'ambar' : ''),
       kpi('Alertas', r.alerta_permanencia + r.sin_sello, `${r.alerta_permanencia} permanencia alta · ${r.sin_sello} sin sello`, (r.alerta_permanencia + r.sin_sello) ? 'ambar' : ''),
       kpi('Anulados hoy', r.anulados_hoy, 'Con motivo y responsable', r.anulados_hoy ? 'ambar' : ''),
     );
@@ -1149,11 +1413,37 @@ function vistaTablero(c) {
         f.estado === 'dentro' && f.sellado_en ? h('span', { class: 'chip ambar' }, `Dentro hace ${duracion(minutosDesde(f.hora_ingreso))}`) : h('span', { class: 'chip rojo' }, 'Sin sello')))) :
         h('p', { class: 'mudo' }, 'No hay vehículos con permanencia alta ni registros sin sello.'));
     ultimos.replaceChildren(tablaIngresos(hoy.slice(0, 12)));
+    turnos.replaceChildren(await tablaTurnos());
   }
   recargar.onclick = () => conBoton(recargar, () => cargar().catch((e) => aviso(mensajeError(e), 'error')));
   cargar().catch((e) => aviso(mensajeError(e), 'error'));
   const t = setInterval(() => cargar().catch(() => {}), 30000);
   return () => clearInterval(t);
+}
+
+const ETIQ_TURNO = { abierto: ['Abierto', 'lima'], entregado: ['Entregado', ''], sin_cierre: ['Sin cierre', 'rojo'] };
+async function tablaTurnos() {
+  const filas = revisar(await sb.from('turnos')
+    .select('id, guarda_id, iniciado_en, estado, cerrado_en, acta, acta_sha256, observacion_entrega, recibido_por, recibido_en, observacion_recibo')
+    .order('id', { ascending: false }).limit(15));
+  if (!filas.length) return h('div', { class: 'vacio-lista' }, 'Aún no hay turnos registrados.');
+  const ids = [...new Set(filas.flatMap((t) => [t.guarda_id, t.recibido_por]).filter(Boolean))];
+  const gente = new Map(revisar(await sb.from('perfiles').select('id, codigo, nombre').in('id', ids)).map((p) => [p.id, p]));
+  const quien = (id) => gente.get(id)?.codigo ?? '—';
+  return h('div', { class: 'tabla-caja' }, h('table', { class: 'tabla', style: { minWidth: '720px' } },
+    h('thead', {}, h('tr', {}, ['Turno', 'Guarda', 'Desde', 'Hasta', 'Estado', 'Dentro al cerrar', 'Recibido por'].map((t) => h('th', {}, t)))),
+    h('tbody', {}, filas.map((t) => h('tr', {
+      onclick: t.acta ? () => modal({ titulo: `Acta del turno ${t.id} · ${quien(t.guarda_id)}`, ancho: '760px',
+        cuerpo: [...cuerpoActa(t.acta, { estado: t.estado, observacion: t.observacion_entrega, huella: t.acta_sha256 }),
+          t.recibido_en ? h('p', { class: 'ayuda', style: { marginTop: '12px' } }, `Recibido por ${quien(t.recibido_por)} el ${fmt.completa(t.recibido_en)}${t.observacion_recibo ? ' · ' + t.observacion_recibo : ''}`) : null] }) : null,
+      style: t.acta ? null : { cursor: 'default' },
+    },
+      h('td', { class: 'mono mudo' }, String(t.id)), h('td', { class: 'placa-celda' }, quien(t.guarda_id)),
+      h('td', { class: 'mono' }, fmt.fechaHora(t.iniciado_en)), h('td', { class: 'mono' }, t.cerrado_en ? fmt.fechaHora(t.cerrado_en) : '—'),
+      h('td', {}, h('span', { class: 'chip ' + ETIQ_TURNO[t.estado][1] }, ETIQ_TURNO[t.estado][0])),
+      h('td', { class: 'mono' }, t.acta ? String(t.acta.vehiculos_dentro.length) : '—'),
+      h('td', { class: 'mono' }, t.recibido_por ? quien(t.recibido_por) : (t.estado === 'abierto' ? '—' : h('span', { class: 'chip ambar' }, 'Pendiente'))),
+    )))));
 }
 
 // ---------------------------------------------------------------------
@@ -1190,7 +1480,7 @@ function vistaRegistros(c) {
 
 function descargarCSV(filas, nombre) {
   if (!filas.length) { aviso('No hay datos para exportar', 'alerta'); return; }
-  const cols = ['consecutivo', 'hora_ingreso', 'placa', 'tipo_vehiculo', 'unidad_codigo', 'guarda_ingreso_codigo', 'hora_salida', 'minutos', 'horas_cobradas', 'valor', 'estado', 'pago_estado', 'pago_referencia', 'pago_metodo', 'registro_sha256', 'foto_original_sha256'];
+  const cols = ['consecutivo', 'hora_ingreso', 'placa', 'tipo_vehiculo', 'unidad_codigo', 'guarda_ingreso_codigo', 'hora_salida', 'minutos', 'horas_cobradas', 'valor', 'estado', 'pago_estado', 'pago_referencia', 'pago_metodo', 'celular_final', 'sin_pago_motivo', 'registro_sha256', 'foto_original_sha256'];
   const celda = (x) => { const s = x == null ? '' : String(x); return /[",\n;]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
   const csv = '﻿' + [cols.join(';'), ...filas.map((f) => cols.map((k) => celda(f[k])).join(';'))].join('\n');
   const a = h('a', { href: URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' })), download: nombre });
@@ -1213,6 +1503,7 @@ async function detalleRegistro(id) {
     const v = revisar(await sb.from('v_ingresos').select('*').eq('id', id).single());
     const foto = h('div');
     const verificacion = h('div', { style: { marginTop: '10px' } });
+    const mensajes = h('div');
     const bloques = [
       h('div', { class: 'fila', style: { marginBottom: '14px' } }, h('span', { class: 'placa-mini' }, v.placa), chipEstado(v.estado), h('span', { class: 'mono mudo' }, consec(v.consecutivo))),
       foto,
@@ -1225,7 +1516,9 @@ async function detalleRegistro(id) {
         v.minutos != null ? [h('dt', {}, 'Tiempo'), h('dd', {}, `${duracion(v.minutos)} · ${v.horas_cobradas} h cobradas`)] : null,
         v.valor != null ? [h('dt', {}, 'Valor'), h('dd', { class: 'mono' }, cop(v.valor))] : null,
         v.pago_estado ? [h('dt', {}, 'Pago'), h('dd', {}, `${v.pago_estado}${v.pago_metodo ? ' · ' + v.pago_metodo : ''} · ${v.pago_referencia}`)] : null,
-        v.cargo_en ? [h('dt', {}, 'Cargo'), h('dd', {}, `A ${v.unidad_codigo}: ${v.cargo_motivo}`)] : null,
+        v.celular_final ? [h('dt', {}, 'WhatsApp'), h('dd', { class: 'mono' }, `••• ••• ${v.celular_final}${v.autoriza_datos ? ' · autorizó' : ''}`)] : null,
+        v.sin_pago_en ? [h('dt', {}, 'Salió sin pagar'), h('dd', {}, `${fmt.completa(v.sin_pago_en)} · ${v.sin_pago_motivo}`)] : null,
+        v.cargo_en ? [h('dt', {}, 'Cargo (histórico)'), h('dd', {}, `A ${v.unidad_codigo}: ${v.cargo_motivo}`)] : null,
         v.anulado_en ? [h('dt', {}, 'Anulación'), h('dd', {}, `${fmt.completa(v.anulado_en)} · ${v.anulacion_motivo}`)] : null,
         v.observacion ? [h('dt', {}, 'Observación'), h('dd', {}, v.observacion)] : null,
         h('dt', {}, 'Huella registro'), h('dd', { class: 'huella' }, v.registro_sha256),
@@ -1233,8 +1526,17 @@ async function detalleRegistro(id) {
         v.foto_original_sha256 ? [h('dt', {}, 'Huella foto'), h('dd', { class: 'huella' }, v.foto_original_sha256)] : null,
       ),
       verificacion,
+      mensajes,
     ];
     cuerpo.replaceChildren(...bloques);
+    sb.from('notificaciones').select('tipo, estado, creado_en, enviado_en, detalle, intentos').eq('ingreso_id', v.id).order('id')
+      .then(({ data }) => {
+        if (!data?.length) return;
+        mensajes.replaceChildren(h('div', { class: 'subtitulo', style: { marginTop: '16px' } }, h('h2', {}, 'Mensajes de WhatsApp')),
+          h('div', { class: 'lista-simple' }, data.map((n) => h('div', {},
+            h('span', {}, ETIQ_NOTIF[n.tipo] ?? n.tipo, ' ', h('span', { class: 'mudo mono' }, fmt.fechaHora(n.enviado_en ?? n.creado_en))),
+            h('span', { class: 'chip ' + (ETIQ_NOTIF_ESTADO[n.estado]?.[1] ?? ''), title: n.detalle ?? '' }, ETIQ_NOTIF_ESTADO[n.estado]?.[0] ?? n.estado)))));
+      });
     if (v.tiene_foto && v.sellado_en) {
       llamar('evidencia', { ingreso_id: v.id, tipo: 'sellada' })
         .then((r) => foto.replaceChildren(h('img', { src: r.url, alt: `Evidencia sellada de ${v.placa}`, style: { borderRadius: '8px', width: '100%' } })))
@@ -1287,23 +1589,24 @@ function vistaConciliacion(c) {
     const cuadra = r.diferencia === 0 && r.pendiente === 0;
     res.replaceChildren(
       h('div', { class: 'banner ' + (cuadra ? 'lima' : 'rojo'), style: { marginBottom: '16px' } },
-        cuadra ? `El día ${fecha.value} cuadra: todo lo cobrable está pagado o cargado a una unidad.` : `Diferencia de ${cop(r.diferencia)} en el día ${fecha.value}. Revise las novedades.`),
+        cuadra ? `El día ${fecha.value} cuadra: todo lo cobrable está pagado.` : `Diferencia de ${cop(r.diferencia)} en el día ${fecha.value}. Revise las novedades.`),
       h('div', { class: 'kpis' },
         kpi('Salidas', r.salidas, `${r.salidas_cobrables} con cobro`),
         kpi('Valor cobrable', cop(r.valor_cobrable), 'Calculado por el servidor'),
         kpi('Pagado', cop(r.pagado), 'Electrónico, aprobado', 'lima'),
-        kpi('Cargos a unidades', cop(r.cargado_unidad), 'Por cobrar en administración', r.cargado_unidad ? 'ambar' : ''),
-        kpi('Pendiente', cop(r.pendiente), 'Sin pago ni cargo', r.pendiente ? 'rojo' : ''),
+        kpi('Salieron sin pagar', cop(r.sin_pago), 'Deuda de la placa, con enlace por WhatsApp', r.sin_pago ? 'rojo' : ''),
+        kpi('Pendiente', cop(r.pendiente), 'Incluye las salidas sin pagar', r.pendiente ? 'rojo' : ''),
+        kpi('Recibos enviados', r.recibos_enviados, 'Por WhatsApp al visitante'),
         kpi('Diferencia', cop(r.diferencia), 'Meta: $0', r.diferencia ? 'rojo' : 'lima'),
         kpi('Ingresos del día', r.ingresos, `${r.anulaciones} anulaciones · ${r.sin_sello} sin sello`),
       ),
       h('div', { class: 'subtitulo' }, h('h2', {}, 'Novedades'), h('span', { class: 'chip ' + (r.novedades.length ? 'rojo' : 'lima') }, String(r.novedades.length))),
       r.novedades.length ? h('div', { class: 'tabla-caja' }, h('table', { class: 'tabla' },
-        h('thead', {}, h('tr', {}, ['#', 'Placa', 'Novedad', 'Valor', 'Pagado', 'Cargado'].map((t, i) => h('th', { class: i > 2 ? 'num' : null }, t)))),
+        h('thead', {}, h('tr', {}, ['#', 'Placa', 'Novedad', 'Valor', 'Pagado'].map((t, i) => h('th', { class: i > 2 ? 'num' : null }, t)))),
         h('tbody', {}, r.novedades.map((n) => h('tr', {},
           h('td', { class: 'mono' }, consec(n.consecutivo)), h('td', { class: 'placa-celda' }, n.placa),
-          h('td', {}, { sin_pago: 'Salida sin pago ni cargo', pago_duplicado: 'Pago duplicado (revisar reembolso)', monto_distinto: 'Monto pagado distinto' }[n.tipo] ?? n.tipo),
-          h('td', { class: 'num' }, cop(n.valor)), h('td', { class: 'num' }, cop(n.pagado)), h('td', { class: 'num' }, cop(n.cargado))))))) :
+          h('td', {}, { sin_pago: 'Salida aún sin pago', salio_sin_pagar: 'Se fue sin pagar (deuda de la placa)', pago_duplicado: 'Pago duplicado (revisar reembolso)', monto_distinto: 'Monto pagado distinto' }[n.tipo] ?? n.tipo),
+          h('td', { class: 'num' }, cop(n.valor)), h('td', { class: 'num' }, cop(n.pagado))))))) :
         h('div', { class: 'vacio-lista' }, 'Sin novedades.'),
     );
   }
@@ -1350,13 +1653,11 @@ function ajustesGeneral(z) {
     anulacion_guarda_min: h('input', { class: 'campo', type: 'number', min: '0', max: '120', value: cfg.anulacion_guarda_min }),
     retencion_dias_visitantes: h('input', { class: 'campo', type: 'number', min: '30', max: '3650', value: cfg.retencion_dias_visitantes }),
     dias_vigencia_clave: h('input', { class: 'campo', type: 'number', min: '30', max: '365', value: cfg.dias_vigencia_clave }),
-    permitir_cargo_unidad: h('select', { class: 'campo' }, h('option', { value: 'true' }, 'Permitido'), h('option', { value: 'false' }, 'No permitido')),
   };
-  campos.permitir_cargo_unidad.value = String(cfg.permitir_cargo_unidad);
   const etiquetas = {
     nombre_conjunto: 'Nombre del conjunto', alerta_permanencia_min: 'Alerta de permanencia (minutos)', qr_minutos_validez: 'Vigencia del QR de pago (minutos)',
     anulacion_guarda_min: 'Minutos que tiene el guarda para anular', retencion_dias_visitantes: 'Retención de fotos de visitantes (días)',
-    dias_vigencia_clave: 'Vigencia de las claves del personal (días)', permitir_cargo_unidad: 'Cargo a la unidad visitada',
+    dias_vigencia_clave: 'Vigencia de las claves del personal (días)',
   };
   const guardar = h('button', { class: 'btn primario' }, 'Guardar cambios');
   const error = h('div', { class: 'error-campo' });
@@ -1368,7 +1669,6 @@ function ajustesGeneral(z) {
       anulacion_guarda_min: Number(campos.anulacion_guarda_min.value),
       retencion_dias_visitantes: Number(campos.retencion_dias_visitantes.value),
       dias_vigencia_clave: Number(campos.dias_vigencia_clave.value),
-      permitir_cargo_unidad: campos.permitir_cargo_unidad.value === 'true',
     };
     const { data, error: e } = await sb.from('configuracion').update(cambios).eq('id', 1).select().single();
     if (e) { error.textContent = e.message; return; }
@@ -1383,9 +1683,60 @@ function ajustesGeneral(z) {
         h('p', {}, 'Modo actual: ', h('span', { class: 'chip ' + (cfg.pagos_modo === 'simulado' ? 'ambar' : 'lima') }, cfg.pagos_modo.replace('_', ' '))),
         h('p', { class: 'mudo' }, 'Para pasar a Wompi se cargan las llaves de la cuenta del conjunto como secretos del servidor (WOMPI_PUBLIC_KEY, WOMPI_INTEGRITY_SECRET y WOMPI_EVENTS_SECRET) y se cambia el modo. Ese paso lo realiza SP Automatizaciones con el representante legal del conjunto.'),
       ),
+      ajustesWhatsapp(),
       S.perfil.rol === 'superadmin' ? mantenimientoEvidencias() : null,
     ),
   ));
+}
+
+function ajustesWhatsapp() {
+  const cfg = S.cfg;
+  const modo = h('select', { class: 'campo', id: 'wa-modo' }, h('option', { value: 'activo' }, 'Activo'), h('option', { value: 'desactivado' }, 'Desactivado'));
+  modo.value = cfg.whatsapp_modo;
+  const prueba = h('input', { class: 'campo mono', id: 'wa-prueba', type: 'tel', inputmode: 'numeric', maxlength: '16', placeholder: 'Vacío = al visitante', value: cfg.whatsapp_numero_prueba ? celularVisible(cfg.whatsapp_numero_prueba) : '' });
+  const dias = h('input', { class: 'campo', id: 'wa-dias', type: 'number', min: '1', max: '60', value: cfg.deuda_dias_enlace });
+  const error = h('div', { class: 'error-campo' });
+  const estado = h('div', { class: 'lista-simple', style: { margin: '10px 0' } });
+  const guardar = h('button', { class: 'btn primario' }, 'Guardar');
+  const reintentar = h('button', { class: 'btn' }, icono('recargar'), 'Reintentar pendientes');
+  async function pintarEstado() {
+    const { data } = await sb.from('notificaciones').select('estado, detalle').gte('creado_en', new Date(Date.now() - 7 * 86_400_000).toISOString()).limit(2000);
+    const n = (e) => (data ?? []).filter((x) => x.estado === e).length;
+    const sinConfigurar = (data ?? []).some((x) => /Falta configurar/i.test(x.detalle ?? ''));
+    estado.replaceChildren(
+      h('div', {}, h('span', {}, 'Enviados (7 días)'), h('span', { class: 'chip lima' }, String(n('enviado')))),
+      h('div', {}, h('span', {}, 'En cola'), h('span', { class: 'chip azul' }, String(n('pendiente') + n('enviando')))),
+      h('div', {}, h('span', {}, 'Fallidos'), h('span', { class: 'chip ' + (n('error') ? 'rojo' : '') }, String(n('error')))),
+      sinConfigurar ? h('div', {}, h('span', { class: 'mudo' }, 'La conexión con Evolution API aún no está configurada en el servidor.'), h('span', { class: 'chip ambar' }, 'Pendiente')) : null,
+    );
+  }
+  prueba.addEventListener('input', () => formatearCelular(prueba));
+  guardar.onclick = () => conBoton(guardar, async () => {
+    error.textContent = '';
+    const numero = normalizarCelular(prueba.value);
+    if (numero && !CELULAR.test(numero)) { error.textContent = 'El número de pruebas debe tener 10 dígitos y empezar por 3.'; return; }
+    const d = Number(dias.value);
+    if (!(d >= 1 && d <= 60)) { error.textContent = 'Los días del enlace de deuda van de 1 a 60.'; return; }
+    const { data, error: e } = await sb.from('configuracion')
+      .update({ whatsapp_modo: modo.value, whatsapp_numero_prueba: numero || null, deuda_dias_enlace: d }).eq('id', 1).select().single();
+    if (e) { error.textContent = e.message; return; }
+    S.cfg = data; aviso('Configuración de WhatsApp guardada');
+  });
+  reintentar.onclick = () => conBoton(reintentar, async () => {
+    try {
+      const n = revisar(await sb.rpc('reintentar_notificaciones'));
+      aviso(n ? `${plural(n, 'mensaje vuelve', 'mensajes vuelven')} a la cola` : 'No hay mensajes por reintentar');
+      await pintarEstado();
+    } catch (e) { aviso(mensajeError(e), 'error'); }
+  });
+  pintarEstado();
+  return h('section', { class: 'panel relleno' }, h('h2', {}, 'Recibos por WhatsApp'),
+    h('p', { class: 'mudo' }, 'Al visitante le llegan el enlace de pago, el recibo (hora de entrada, salida, tiempo y valor) y, si se fue sin pagar, el recordatorio de la deuda. Los mensajes salen por Evolution API.'),
+    estado,
+    h('div', { class: 'grupo' }, h('label', { class: 'etiqueta', for: 'wa-modo' }, 'Envío'), modo),
+    h('div', { class: 'grupo' }, h('label', { class: 'etiqueta', for: 'wa-prueba' }, 'Número de pruebas (recibe todos los mensajes)'), prueba),
+    h('div', { class: 'grupo' }, h('label', { class: 'etiqueta', for: 'wa-dias' }, 'Vigencia del enlace de deuda (días)'), dias),
+    error, h('div', { class: 'fila', style: { marginTop: '12px' } }, guardar, reintentar));
 }
 
 function mantenimientoEvidencias() {
@@ -1578,8 +1929,14 @@ window.addEventListener('online', () => { pintarPie(); sincronizarCola(); });
 window.addEventListener('offline', pintarPie);
 setInterval(sincronizarCola, 30000);
 sb.auth.onAuthStateChange((evento) => {
-  if (evento === 'SIGNED_OUT') { S.perfil = null; vistaAcceso(); }
+  if (evento === 'SIGNED_OUT') {
+    clearInterval(S.vigilancia); S.vigilancia = null;
+    S.perfil = null; S.turno = null; S.porRecibir = null;
+    vistaAcceso(S.motivoSalida ?? undefined);
+  }
 });
+// Al volver a la aplicación (pantalla encendida, cambio de pestaña) se confirma que la sesión sigue activa
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') verificarSesion(); });
 if ('serviceWorker' in navigator && location.protocol === 'https:') {
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }

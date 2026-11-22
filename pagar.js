@@ -15,6 +15,40 @@ const ESTADOS = {
   ERROR: ['Error en el pago', 'rojo'], ANULADO: ['Pago anulado', 'rojo'], EXPIRADO: ['Cobro vencido', 'ambar'],
 };
 let sondeo = null;
+const ZONA = CONFIG.ZONA ?? 'America/Bogota';
+const fecha = (iso) => new Intl.DateTimeFormat('es-CO', { timeZone: ZONA, dateStyle: 'medium', timeStyle: 'short', hourCycle: 'h23' }).format(new Date(iso));
+function duracion(min) {
+  if (min == null) return '—';
+  if (min < 60) return `${min} min`;
+  const hh = Math.floor(min / 60), mm = min % 60;
+  return mm ? `${hh} h ${mm} min` : `${hh} h`;
+}
+
+// Recibo de pago (soporte para el visitante y para el cruce de cuentas; no es factura electrónica)
+function vistaRecibo(d) {
+  const r = d.recibo;
+  const imprimir = el('button', { class: 'btn bloque no-imprimir', onclick: () => window.print() }, 'Guardar o imprimir recibo');
+  return el('div', { class: 'panel recibo' },
+    el('div', { class: 'encabezado' },
+      el('div', {}, el('div', { class: 'etiqueta' }, 'Recibo de pago · parqueadero de visitantes'), el('div', { style: 'font-weight:600;margin-top:4px' }, d.conjunto)),
+      el('span', { class: 'chip lima' }, 'Pagado')),
+    el('div', { class: 'recibo-numero mono' }, r.numero),
+    el('div', { class: 'etiqueta' }, 'Valor pagado'),
+    el('div', { class: 'monto', style: 'margin:6px 0 14px' }, cop(d.monto)),
+    el('dl', { class: 'dato-lista' },
+      el('dt', {}, 'Vehículo'), el('dd', { class: 'mono' }, `${d.placa} · ${d.tipo_vehiculo ?? ''}`),
+      r.destino ? [el('dt', {}, 'Destino'), el('dd', { class: 'mono' }, r.destino)] : null,
+      el('dt', {}, 'Entrada'), el('dd', {}, fecha(r.hora_ingreso)),
+      r.hora_salida ? [el('dt', {}, 'Salida'), el('dd', {}, fecha(r.hora_salida))] : null,
+      el('dt', {}, 'Tiempo'), el('dd', {}, duracion(r.minutos)),
+      r.horas_cobradas != null ? [el('dt', {}, 'Liquidación'), el('dd', { class: 'mono' }, `${r.horas_cobradas} h × ${cop(r.tarifa_hora)}`)] : null,
+      el('dt', {}, 'Medio de pago'), el('dd', {}, r.metodo ?? 'Electrónico'),
+      el('dt', {}, 'Fecha de pago'), el('dd', {}, fecha(r.pagado_en)),
+      el('dt', {}, 'Referencia'), el('dd', { class: 'mono' }, d.referencia),
+      el('dt', {}, 'Huella del registro'), el('dd', { class: 'huella' }, r.huella)),
+    el('p', { class: 'ayuda', style: 'margin:16px 0 0' }, 'Soporte de pago emitido por el sistema de portería del conjunto. La hora de entrada y la de salida las fija el servidor. Este documento no es una factura electrónica.'),
+    el('div', { class: 'acciones' }, imprimir));
+}
 
 function el(tag, props = {}, ...hijos) {
   const e = document.createElement(tag);
@@ -22,7 +56,7 @@ function el(tag, props = {}, ...hijos) {
     if (v == null || v === false) continue;
     if (k === 'class') e.className = v; else if (k.startsWith('on')) e.addEventListener(k.slice(2), v); else e.setAttribute(k, v);
   }
-  for (const c of hijos.flat()) if (c != null && c !== false) e.append(c instanceof Node ? c : document.createTextNode(String(c)));
+  for (const c of hijos.flat(Infinity)) if (c != null && c !== false) e.append(c instanceof Node ? c : document.createTextNode(String(c)));
   return e;
 }
 
@@ -71,6 +105,13 @@ async function pintar() {
     aprobar.addEventListener('click', () => simular('APPROVED', aprobar));
     rechazar.addEventListener('click', () => simular('DECLINED', rechazar));
     acciones.append(el('div', { class: 'banner ambar' }, 'Modo de pruebas: no se realiza ningún cobro real.'), aprobar, rechazar);
+  }
+  if (d.estado === 'APROBADO' && d.recibo) {
+    raiz.replaceChildren(vistaRecibo(d),
+      el('footer', {}, el('span', {}, 'Pago electrónico operado por'), el('img', { src: 'marca/spa-logo-negativo.svg', alt: 'SP Automatizaciones', width: '101', height: '22' })));
+    document.title = `Recibo ${d.recibo.numero} · La Esperanza 1`;
+    clearInterval(sondeo);
+    return;
   }
   raiz.replaceChildren(
     el('div', { class: 'panel' },

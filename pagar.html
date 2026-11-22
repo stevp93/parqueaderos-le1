@@ -22,6 +22,17 @@
   .pago .acciones { display: grid; gap: 10px; margin-top: 18px; }
   .pago footer { margin-top: 16px; display: flex; align-items: center; justify-content: center; gap: 10px; font-family: var(--mono); font-size: 11px; letter-spacing: .12em; color: var(--mudo); text-transform: uppercase; }
   .pago footer img { height: 22px; width: auto; display: block; opacity: .9; }
+  .pago .recibo-numero { font-size: 22px; font-weight: 600; letter-spacing: .06em; margin: -8px 0 18px; color: var(--lima); }
+  .pago .huella { word-break: break-all; font-size: 11px; }
+  @media print {
+    body { background: #fff; color: #111; padding: 0; }
+    .pago .panel { border: 1px solid #999; background: #fff; }
+    .pago .etiqueta, .pago .ayuda, .pago dt, .pago footer { color: #444; }
+    .pago .recibo-numero, .pago .monto, .pago dd { color: #111; }
+    .pago .chip { color: #111; border-color: #999; background: #fff; }
+    .pago footer img { filter: invert(1); }
+    .no-imprimir { display: none !important; }
+  }
 </style>
 </head>
 <body>
