@@ -82,6 +82,7 @@ const cop = (n) => '$' + Math.round(Number(n || 0)).toLocaleString('es-CO');
 const fmt = {
   hora: (iso) => new Intl.DateTimeFormat('es-CO', { timeZone: ZONA, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(new Date(iso)),
   horaSeg: (iso) => new Intl.DateTimeFormat('es-CO', { timeZone: ZONA, hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' }).format(new Date(iso)),
+  fecha: (iso) => new Intl.DateTimeFormat('es-CO', { timeZone: ZONA, day: '2-digit', month: 'short', year: 'numeric' }).format(new Date(iso)),
   fechaHora: (iso) => new Intl.DateTimeFormat('es-CO', { timeZone: ZONA, day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(new Date(iso)),
   completa: (iso) => new Intl.DateTimeFormat('es-CO', { timeZone: ZONA, dateStyle: 'medium', timeStyle: 'medium', hourCycle: 'h23' }).format(new Date(iso)),
 };
@@ -329,40 +330,103 @@ function vistaAcceso(mensaje) {
       await iniciarSesion();
     });
   });
-  raiz.replaceChildren(h('main', { class: 'acceso' },
-    h('section', { class: 'acceso-marca' },
-      h('div', {},
-        h('div', { class: 'acceso-firma' }, logo(46, 'horizontal'), h('span', { class: 'contexto' }, 'Soacha · CO · Est 2026')),
-        h('h1', {}, 'Portería digital ', h('em', {}, 'sin efectivo'), ' y con evidencia sellada'),
-        h('p', {}, 'Cada ingreso queda con foto y hora del servidor; cada pago llega directo a la cuenta del conjunto.'),
-      ),
-      h('div', { class: 'acceso-datos' },
-        h('span', {}, 'Conjunto ', h('b', {}, 'La Esperanza 1')),
-        h('span', {}, 'Módulo ', h('b', {}, '1 · Acceso y recaudo')),
-        h('span', {}, 'Versión ', h('b', {}, CONFIG.VERSION)),
-      ),
-    ),
-    h('section', { class: 'acceso-form' }, form),
-  ));
+  raiz.replaceChildren(h('main', { class: 'acceso' }, heroAcceso(), h('section', { class: 'acceso-form' }, form)));
   usuario.focus();
+}
+
+function heroAcceso() {
+  return h('section', { class: 'acceso-marca' },
+    h('div', {},
+      h('div', { class: 'acceso-firma' }, logo(46, 'horizontal'), h('span', { class: 'contexto' }, 'Soacha · CO · Est 2026')),
+      h('h1', {}, 'Portería digital ', h('em', {}, 'sin efectivo'), ' y con evidencia sellada'),
+      h('p', {}, 'Cada ingreso queda con foto y hora del servidor; cada pago llega directo a la cuenta del conjunto.'),
+    ),
+    h('div', { class: 'acceso-datos' },
+      h('span', {}, 'Conjunto ', h('b', {}, 'La Esperanza 1')),
+      h('span', {}, 'Módulo ', h('b', {}, '1 · Acceso y recaudo')),
+      h('span', {}, 'Versión ', h('b', {}, CONFIG.VERSION)),
+    ),
+  );
+}
+
+// ---------------------------------------------------------------------
+// Política de claves: la clave asignada es temporal (se cambia una sola vez al primer
+// ingreso) y luego vence cada N días (90 por defecto). La base de datos y las funciones
+// niegan todo mientras la clave esté pendiente; esta pantalla es el único paso posible.
+// ---------------------------------------------------------------------
+const claveVigente = (p) => Boolean(p?.clave_vence_en) && new Date(p.clave_vence_en) > new Date();
+const minimoClave = (rol) => (rol === 'guarda' ? 6 : 8);
+function mensajeClave(e) {
+  const m = e?.message ?? String(e);
+  if (e?.code === 'same_password' || /different from the old/i.test(m)) return 'La nueva clave debe ser distinta de la anterior.';
+  if (e?.code === 'weak_password' || /weak|pwned|leaked|known/i.test(m)) return 'Esa clave es muy común o aparece en filtraciones conocidas. Elija otra.';
+  return m;
+}
+async function guardarClaveNueva(rol, nueva, confirma) {
+  const minimo = minimoClave(rol);
+  if (nueva.length < minimo) throw new Error(`La clave debe tener al menos ${minimo} caracteres.`);
+  if (nueva !== confirma) throw new Error('Las claves no coinciden.');
+  const { error: e } = await sb.auth.updateUser({ password: nueva });
+  if (e) throw new Error(mensajeClave(e));
+}
+
+function vistaCambioClave(perfil) {
+  detenerVista();
+  const primera = !perfil.clave_cambiada_en;
+  const dias = perfil.clave_cambiada_en && perfil.clave_vence_en
+    ? Math.round((new Date(perfil.clave_vence_en) - new Date(perfil.clave_cambiada_en)) / 86_400_000) : null;
+  const minimo = minimoClave(perfil.rol);
+  const nueva = h('input', { class: 'campo', type: 'password', id: 'nueva-clave', autocomplete: 'new-password', required: true });
+  const confirma = h('input', { class: 'campo', type: 'password', id: 'confirma-clave', autocomplete: 'new-password', required: true });
+  const error = h('div', { class: 'error-campo', role: 'alert' });
+  const boton = h('button', { class: 'btn primario grande bloque', type: 'submit' }, 'Guardar mi clave');
+  const salir = h('button', { class: 'btn fantasma bloque', type: 'button', style: { marginTop: '10px' } }, 'Cerrar sesión');
+  salir.onclick = async () => { await sb.auth.signOut(); location.hash = ''; vistaAcceso(); };
+  const form = h('form', { class: 'acceso-caja', novalidate: true },
+    h('div', { class: 'etiqueta' }, primera ? 'Primer ingreso' : 'Clave vencida'),
+    h('h2', {}, primera ? 'Cree su clave personal' : 'Renueve su clave'),
+    h('p', { class: 'ayuda', style: { margin: '0 0 18px' } }, primera
+      ? `${perfil.nombre}, la clave que le entregaron es temporal. Cámbiela por una que solo usted conozca: se pide una sola vez y después se renueva periódicamente.`
+      : `Por seguridad, las claves se renuevan cada ${dias ?? 90} días. La nueva debe ser distinta de la anterior.`),
+    h('div', { class: 'grupo' }, h('label', { for: 'nueva-clave', class: 'etiqueta' }, `Nueva clave (mínimo ${minimo})`), nueva),
+    h('div', { class: 'grupo' }, h('label', { for: 'confirma-clave', class: 'etiqueta' }, 'Repita la clave'), confirma),
+    h('div', { style: { marginTop: '10px' } }, error),
+    boton, salir,
+  );
+  form.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    error.textContent = '';
+    await conBoton(boton, async () => {
+      try {
+        await guardarClaveNueva(perfil.rol, nueva.value, confirma.value);
+      } catch (e) { error.textContent = e.message; return; }
+      aviso('Clave guardada');
+      await iniciarSesion();
+    });
+  });
+  $('#raiz').replaceChildren(h('main', { class: 'acceso' }, heroAcceso(), h('section', { class: 'acceso-form' }, form)));
+  nueva.focus();
 }
 
 async function iniciarSesion() {
   const { data: { user } } = await sb.auth.getUser();
   if (!user) return vistaAcceso();
-  const { data: perfil } = await sb.from('perfiles').select('id, nombre, codigo, rol, activo').eq('id', user.id).maybeSingle();
+  const { data: perfil } = await sb.from('perfiles').select('id, nombre, codigo, rol, activo, clave_cambiada_en, clave_vence_en').eq('id', user.id).maybeSingle();
   if (!perfil || !perfil.activo) {
     await sb.auth.signOut();
     return vistaAcceso('Su usuario está inactivo o no tiene perfil. Consulte a la administración.');
   }
   S.usuario = user;
   S.perfil = perfil;
+  if (!claveVigente(perfil)) return vistaCambioClave(perfil);
   try {
     await cargarCatalogos();
   } catch (e) {
     return vistaAcceso('No se pudo cargar la configuración: ' + mensajeError(e));
   }
   montarApp();
+  const diasRestantes = Math.ceil((new Date(perfil.clave_vence_en) - new Date()) / 86_400_000);
+  if (diasRestantes <= 7) aviso(`Su clave vence en ${plural(diasRestantes, 'día', 'días')}. Puede cambiarla en Mi cuenta.`, 'ok', 8000);
   await actualizarCola();
   sincronizarCola();
 }
@@ -428,6 +492,7 @@ function detenerVista() {
 }
 
 function irA(clave) {
+  if (!claveVigente(S.perfil)) return vistaCambioClave(S.perfil);
   const permitidas = vistasPermitidas();
   if (!permitidas.includes(clave)) clave = permitidas[0];
   detenerVista();
@@ -455,7 +520,7 @@ function abrirCuenta() {
   const nueva = h('input', { class: 'campo', type: 'password', autocomplete: 'new-password', id: 'nueva' });
   const confirma = h('input', { class: 'campo', type: 'password', autocomplete: 'new-password', id: 'confirma' });
   const error = h('div', { class: 'error-campo' });
-  const minimo = S.perfil.rol === 'guarda' ? 6 : 8;
+  const minimo = minimoClave(S.perfil.rol);
   const guardar = h('button', { class: 'btn primario' }, 'Cambiar clave');
   const m = modal({
     titulo: 'Mi cuenta',
@@ -464,6 +529,7 @@ function abrirCuenta() {
         h('dt', {}, 'Nombre'), h('dd', {}, S.perfil.nombre),
         h('dt', {}, 'Código'), h('dd', { class: 'mono' }, S.perfil.codigo),
         h('dt', {}, 'Rol'), h('dd', {}, ROL_NOMBRE[S.perfil.rol]),
+        h('dt', {}, 'Clave vigente hasta'), h('dd', { class: 'mono' }, fmt.fecha(S.perfil.clave_vence_en)),
       ),
       h('hr', { class: 'sep' }),
       h('div', { class: 'grupo' }, h('label', { class: 'etiqueta', for: 'nueva' }, `Nueva clave (mínimo ${minimo})`), nueva),
@@ -477,11 +543,12 @@ function abrirCuenta() {
   });
   guardar.addEventListener('click', () => conBoton(guardar, async () => {
     error.textContent = '';
-    if (nueva.value.length < minimo) { error.textContent = `La clave debe tener al menos ${minimo} caracteres.`; return; }
-    if (nueva.value !== confirma.value) { error.textContent = 'Las claves no coinciden.'; return; }
-    const { error: e } = await sb.auth.updateUser({ password: nueva.value });
-    if (e) { error.textContent = e.message; return; }
-    aviso('Clave actualizada');
+    try {
+      await guardarClaveNueva(S.perfil.rol, nueva.value, confirma.value);
+    } catch (e) { error.textContent = e.message; return; }
+    const { data: p } = await sb.from('perfiles').select('clave_cambiada_en, clave_vence_en').eq('id', S.perfil.id).single();
+    if (p) Object.assign(S.perfil, p);
+    aviso(`Clave actualizada. Vigente hasta ${fmt.fecha(S.perfil.clave_vence_en)}.`);
     m.cerrar();
   }));
 }
@@ -1254,13 +1321,14 @@ function ajustesGeneral(z) {
     qr_minutos_validez: h('input', { class: 'campo', type: 'number', min: '3', max: '120', value: cfg.qr_minutos_validez }),
     anulacion_guarda_min: h('input', { class: 'campo', type: 'number', min: '0', max: '120', value: cfg.anulacion_guarda_min }),
     retencion_dias_visitantes: h('input', { class: 'campo', type: 'number', min: '30', max: '3650', value: cfg.retencion_dias_visitantes }),
+    dias_vigencia_clave: h('input', { class: 'campo', type: 'number', min: '30', max: '365', value: cfg.dias_vigencia_clave }),
     permitir_cargo_unidad: h('select', { class: 'campo' }, h('option', { value: 'true' }, 'Permitido'), h('option', { value: 'false' }, 'No permitido')),
   };
   campos.permitir_cargo_unidad.value = String(cfg.permitir_cargo_unidad);
   const etiquetas = {
     nombre_conjunto: 'Nombre del conjunto', alerta_permanencia_min: 'Alerta de permanencia (minutos)', qr_minutos_validez: 'Vigencia del QR de pago (minutos)',
     anulacion_guarda_min: 'Minutos que tiene el guarda para anular', retencion_dias_visitantes: 'Retención de fotos de visitantes (días)',
-    permitir_cargo_unidad: 'Cargo a la unidad visitada',
+    dias_vigencia_clave: 'Vigencia de las claves del personal (días)', permitir_cargo_unidad: 'Cargo a la unidad visitada',
   };
   const guardar = h('button', { class: 'btn primario' }, 'Guardar cambios');
   const error = h('div', { class: 'error-campo' });
@@ -1271,6 +1339,7 @@ function ajustesGeneral(z) {
       qr_minutos_validez: Number(campos.qr_minutos_validez.value),
       anulacion_guarda_min: Number(campos.anulacion_guarda_min.value),
       retencion_dias_visitantes: Number(campos.retencion_dias_visitantes.value),
+      dias_vigencia_clave: Number(campos.dias_vigencia_clave.value),
       permitir_cargo_unidad: campos.permitir_cargo_unidad.value === 'true',
     };
     const { data, error: e } = await sb.from('configuracion').update(cambios).eq('id', 1).select().single();
@@ -1428,11 +1497,15 @@ function ajustesPersonal(z) {
   const error = h('div', { class: 'error-campo' });
   async function cargar() {
     const r = await llamar('admin-usuarios', { accion: 'listar' });
-    lista.replaceChildren(h('div', { class: 'tabla-caja' }, h('table', { class: 'tabla', style: { minWidth: '640px' } },
-      h('thead', {}, h('tr', {}, ['Código', 'Nombre', 'Rol', 'Último ingreso', 'Estado', ''].map((t) => h('th', {}, t)))),
+    const estadoClave = (u) => (!u.clave_vence_en ? h('span', { class: 'chip ambar' }, 'Temporal')
+      : new Date(u.clave_vence_en) <= new Date() ? h('span', { class: 'chip rojo' }, 'Vencida')
+        : h('span', { class: 'mono', title: 'Vence' }, fmt.fecha(u.clave_vence_en)));
+    lista.replaceChildren(h('div', { class: 'tabla-caja' }, h('table', { class: 'tabla', style: { minWidth: '760px' } },
+      h('thead', {}, h('tr', {}, ['Código', 'Nombre', 'Rol', 'Último ingreso', 'Clave vence', 'Estado', ''].map((t) => h('th', {}, t)))),
       h('tbody', {}, r.usuarios.map((u) => h('tr', { style: { cursor: 'default' } },
         h('td', { class: 'placa-celda' }, u.codigo), h('td', {}, u.nombre), h('td', {}, ROL_NOMBRE[u.rol]),
         h('td', { class: 'mono' }, u.ultimo_ingreso ? fmt.fechaHora(u.ultimo_ingreso) : '—'),
+        h('td', {}, estadoClave(u)),
         h('td', {}, u.activo ? h('span', { class: 'chip lima' }, 'Activo') : h('span', { class: 'chip rojo' }, 'Inactivo')),
         h('td', {}, u.id === S.perfil.id ? h('span', { class: 'mudo' }, 'Usted') : h('div', { class: 'fila' },
           h('button', { class: 'btn chico', onclick: (ev) => conBoton(ev.currentTarget, async () => {
@@ -1444,16 +1517,16 @@ function ajustesPersonal(z) {
     const nueva = h('input', { class: 'campo', type: 'password', autocomplete: 'new-password' });
     const err = h('div', { class: 'error-campo' });
     const ok = h('button', { class: 'btn primario' }, 'Asignar clave');
-    const m = modal({ titulo: `Nueva clave · ${u.codigo}`, cuerpo: [h('div', { class: 'grupo' }, h('label', { class: 'etiqueta' }, 'Clave nueva'), nueva), err], acciones: [h('button', { class: 'btn', onclick: () => m.cerrar() }, 'Cancelar'), ok] });
+    const m = modal({ titulo: `Clave temporal · ${u.codigo}`, cuerpo: [h('p', { class: 'mudo', style: { marginTop: 0 } }, 'La clave que asigne es temporal: el usuario deberá cambiarla por una propia al ingresar.'), h('div', { class: 'grupo' }, h('label', { class: 'etiqueta' }, 'Clave temporal'), nueva), err], acciones: [h('button', { class: 'btn', onclick: () => m.cerrar() }, 'Cancelar'), ok] });
     ok.onclick = () => conBoton(ok, async () => {
-      try { await llamar('admin-usuarios', { accion: 'clave', id: u.id, clave: nueva.value }); aviso(`Clave de ${u.codigo} actualizada`); m.cerrar(); } catch (e) { err.textContent = mensajeError(e); }
+      try { await llamar('admin-usuarios', { accion: 'clave', id: u.id, clave: nueva.value }); aviso(`Clave temporal asignada a ${u.codigo}`); m.cerrar(); await cargar(); } catch (e) { err.textContent = mensajeError(e); }
     });
   }
   crear.onclick = () => conBoton(crear, async () => {
     error.textContent = '';
     try {
       const r = await llamar('admin-usuarios', { accion: 'crear', nombre: nombre.value.trim(), codigo: codigo.value.trim().toUpperCase(), rol: rol.value, email: email.value.trim() || undefined, clave: clave.value });
-      aviso(`Usuario ${r.codigo} creado. Ingresa con su código y la clave asignada.`);
+      aviso(`Usuario ${r.codigo} creado. En su primer ingreso deberá cambiar la clave temporal.`);
       nombre.value = ''; codigo.value = ''; email.value = ''; clave.value = '';
       await cargar();
     } catch (e) { error.textContent = mensajeError(e); }
@@ -1464,7 +1537,7 @@ function ajustesPersonal(z) {
       h('div', { class: 'grupo' }, h('label', { class: 'etiqueta' }, 'Código de ingreso'), codigo),
       h('div', { class: 'grupo' }, h('label', { class: 'etiqueta' }, 'Rol'), rol),
       h('div', { class: 'grupo' }, h('label', { class: 'etiqueta' }, 'Correo'), email),
-      h('div', { class: 'grupo' }, h('label', { class: 'etiqueta' }, 'Clave inicial'), clave),
+      h('div', { class: 'grupo' }, h('label', { class: 'etiqueta' }, 'Clave temporal'), clave),
       error, crear)));
   cargar().catch((e) => aviso(mensajeError(e), 'error'));
 }
