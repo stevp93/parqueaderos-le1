@@ -371,12 +371,12 @@ const claveVigente = (p) => Boolean(p?.clave_vence_en) && new Date(p.clave_vence
 // Requisito para todos los roles: mínimo 8 caracteres con letras y números (alfanumérica).
 const CLAVE_MINIMO = 8;
 const minimoClave = () => CLAVE_MINIMO;
-const REQUISITO_CLAVE = `mínimo ${CLAVE_MINIMO} caracteres, con letras y números`;
+const REQUISITO_CLAVE = `mínimo ${CLAVE_MINIMO} caracteres, con letras (A–Z) y números`;
 const textoLibre = (v) => String(v ?? '').replace(/[<>]/g, '').replace(/\s+/g, ' ').trim();
 function revisarClave(c) {
   if (c.length < CLAVE_MINIMO) return `La clave debe tener al menos ${CLAVE_MINIMO} caracteres.`;
   if (c.length > 72) return 'La clave es demasiado larga (máximo 72 caracteres).';
-  if (!/[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]/.test(c) || !/\d/.test(c)) return 'La clave debe combinar letras y números.';
+  if (!/[A-Za-z]/.test(c) || !/\d/.test(c)) return 'La clave debe combinar letras y números.';
   return null;
 }
 function mensajeClave(e) {
