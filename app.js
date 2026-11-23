@@ -1785,8 +1785,18 @@ function ajustesGeneral(z) {
       inactividad_min_personal: Number(campos.inactividad_min_personal.value),
       inactividad_min_guarda: Number(campos.inactividad_min_guarda.value),
     };
+    // Rangos permitidos (los mismos que impone la base de datos)
+    for (const [k, el] of Object.entries(campos)) {
+      if (el.type !== 'number') continue;
+      const v = Number(el.value), min = Number(el.min), max = Number(el.max);
+      if (!Number.isInteger(v) || v < min || v > max) {
+        error.textContent = `${etiquetas[k]}: escriba un número entero entre ${min} y ${max}.`;
+        el.focus(); return;
+      }
+    }
+    if (!cambios.nombre_conjunto) { error.textContent = 'Escriba el nombre del conjunto.'; return; }
     const { data, error: e } = await sb.from('configuracion').update(cambios).eq('id', 1).select().single();
-    if (e) { error.textContent = e.message; return; }
+    if (e) { error.textContent = e.code === '23514' ? 'Uno de los valores está fuera del rango permitido.' : e.message; return; }
     S.cfg = data; error.textContent = ''; aviso('Configuración guardada');
   });
   z.append(h('div', { class: 'dos-columnas', style: { marginTop: 0 } },
