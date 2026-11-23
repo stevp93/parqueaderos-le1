@@ -391,3 +391,7 @@ table.tabla { width: 100%; border-collapse: collapse; font-size: 14px; min-width
 .casilla input { flex: none; width: 22px; height: 22px; margin: 0; accent-color: var(--lima); cursor: pointer; }
 .casilla:focus-within { border-color: var(--lima); }
 .campo[aria-invalid] { border-color: var(--rojo); }
+
+/* ---------- v1.4: verificación anti-robots ---------- */
+.captcha { margin: 6px 0 4px; min-height: 65px; }
+.captcha iframe { max-width: 100%; }

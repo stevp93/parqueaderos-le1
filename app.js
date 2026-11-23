@@ -256,6 +256,7 @@ async function expulsar(mensaje = MSG_SESION_CERRADA) {
   if (expulsando) return;
   expulsando = true;
   S.motivoSalida = mensaje;
+  detenerInactividad();
   detenerVista();
   clearInterval(S.vigilancia); S.vigilancia = null;
   try { await sb.auth.signOut({ scope: 'local' }); } catch { /* la sesión ya no existe en el servidor */ }
@@ -388,6 +389,89 @@ async function actualizarCola() {
 // ---------------------------------------------------------------------
 // Acceso
 // ---------------------------------------------------------------------
+// Verificación anti-robots en el ingreso (Cloudflare Turnstile, validada por Supabase Auth)
+// ---------------------------------------------------------------------
+let turnstileCarga = null;
+function cargarTurnstile() {
+  if (!CONFIG.TURNSTILE_SITE_KEY) return null;
+  turnstileCarga ??= new Promise((ok, falla) => {
+    const s = document.createElement('script');
+    s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+    s.async = true;
+    s.onload = () => ok(window.turnstile);
+    s.onerror = () => { turnstileCarga = null; falla(new Error('No se pudo cargar la verificación de seguridad. Revise la conexión.')); };
+    document.head.append(s);
+  });
+  return turnstileCarga;
+}
+
+// ---------------------------------------------------------------------
+// Cierre de sesión por inactividad: aviso 60 s antes; la última actividad se comparte entre pestañas
+// ---------------------------------------------------------------------
+const CLAVE_ACTIVIDAD = 'le1-ultima-actividad';
+const minutosInactividad = () => (S.perfil?.rol === 'guarda' ? S.cfg?.inactividad_min_guarda : S.cfg?.inactividad_min_personal) || 15;
+function marcarActividad() {
+  const ahora = Date.now();
+  if (ahora - (S.ultimaMarca ?? 0) < 5000) return;
+  S.ultimaMarca = ahora;
+  try { localStorage.setItem(CLAVE_ACTIVIDAD, String(ahora)); } catch { /* almacenamiento no disponible */ }
+  if (S.avisoInactividad) { S.avisoInactividad.cerrar(); S.avisoInactividad = null; }
+}
+function ultimaActividad() {
+  try { return Number(localStorage.getItem(CLAVE_ACTIVIDAD)) || S.ultimaMarca || Date.now(); } catch { return S.ultimaMarca || Date.now(); }
+}
+const EVENTOS_ACTIVIDAD = ['pointerdown', 'keydown', 'wheel', 'touchstart'];
+function iniciarInactividad() {
+  detenerInactividad();
+  S.ultimaMarca = 0;
+  marcarActividad();
+  for (const ev of EVENTOS_ACTIVIDAD) document.addEventListener(ev, marcarActividad, { passive: true, capture: true });
+  S.relojInactividad = setInterval(revisarInactividad, 5000);
+}
+function detenerInactividad() {
+  clearInterval(S.relojInactividad); S.relojInactividad = null;
+  for (const ev of EVENTOS_ACTIVIDAD) document.removeEventListener(ev, marcarActividad, { capture: true });
+  if (S.avisoInactividad) { S.avisoInactividad.cerrar(); S.avisoInactividad = null; }
+}
+function revisarInactividad() {
+  if (!S.perfil) return detenerInactividad();
+  const limite = minutosInactividad() * 60_000;
+  const resto = limite - (Date.now() - ultimaActividad());
+  if (resto <= 0) return cerrarPorInactividad();
+  if (resto <= 60_000 && !S.avisoInactividad) {
+    const seguir = h('button', { class: 'btn primario' }, 'Seguir conectado');
+    const salir = h('button', { class: 'btn' }, 'Cerrar sesión');
+    const cuenta = h('b', { class: 'mono' }, '60');
+    S.avisoInactividad = modal({
+      titulo: 'Sesión inactiva',
+      cuerpo: [h('p', {}, 'Por seguridad, la sesión se cerrará en ', cuenta, ' segundos si no hay actividad.'),
+        S.perfil.rol === 'guarda' ? h('p', { class: 'ayuda' }, 'Su turno sigue abierto: al volver a ingresar con su clave continúa donde estaba.') : null],
+      acciones: [salir, seguir],
+    });
+    const t = setInterval(() => {
+      const r = Math.max(0, Math.ceil((limite - (Date.now() - ultimaActividad())) / 1000));
+      cuenta.textContent = String(r);
+      if (!S.avisoInactividad) clearInterval(t);
+    }, 1000);
+    seguir.onclick = () => { S.ultimaMarca = 0; marcarActividad(); };
+    salir.onclick = () => cerrarPorInactividad(true);
+  }
+}
+async function cerrarPorInactividad(voluntario = false) {
+  const min = minutosInactividad();
+  detenerInactividad();
+  clearInterval(S.vigilancia); S.vigilancia = null;
+  S.motivoSalida = voluntario ? 'Sesión cerrada.' : `Sesión cerrada por inactividad (${min} minutos sin uso).${S.perfil?.rol === 'guarda' ? ' Su turno sigue abierto: ingrese de nuevo para continuar.' : ''}`;
+  const motivo = S.motivoSalida;
+  detenerVista();
+  try { await sb.auth.signOut({ scope: 'local' }); } catch { /* la sesión ya no existe */ }
+  S.perfil = null;
+  for (const v of document.querySelectorAll('.velo, .cajon')) v.remove();
+  location.hash = '';
+  vistaAcceso(motivo); S.motivoSalida = null;
+}
+
+// ---------------------------------------------------------------------
 function vistaAcceso(mensaje) {
   detenerVista();
   const raiz = $('#raiz');
@@ -397,12 +481,26 @@ function vistaAcceso(mensaje) {
   const usuario = h('input', { class: 'campo', id: 'usuario', autocomplete: 'username', placeholder: 'Ej.: G-07 o correo', required: true, autocapitalize: 'characters' });
   const clave = h('input', { class: 'campo', id: 'clave', type: 'password', autocomplete: 'current-password', required: true });
   const boton = h('button', { class: 'btn primario grande bloque', type: 'submit' }, 'Ingresar');
+  const captcha = CONFIG.TURNSTILE_SITE_KEY ? h('div', { class: 'captcha', 'aria-label': 'Verificación de seguridad' }) : null;
+  let captchaToken = null; let captchaId = null;
+  if (captcha) {
+    cargarTurnstile().then((ts) => {
+      captchaId = ts.render(captcha, {
+        sitekey: CONFIG.TURNSTILE_SITE_KEY, language: 'es', theme: 'dark', size: 'flexible', action: 'ingreso',
+        callback: (t) => { captchaToken = t; if (/verificaci/i.test(error.textContent)) error.textContent = ''; },
+        'expired-callback': () => { captchaToken = null; },
+        'error-callback': () => { captchaToken = null; error.textContent = 'La verificación de seguridad falló. Recargue la página e intente de nuevo.'; },
+      });
+    }).catch((e) => { error.textContent = e.message; });
+  }
+  const reiniciarCaptcha = () => { captchaToken = null; if (captchaId !== null) try { window.turnstile.reset(captchaId); } catch { /* sin widget */ } };
   const form = h('form', { class: 'acceso-caja', novalidate: true },
     nota,
     h('div', { class: 'etiqueta' }, 'Acceso del personal'),
     h('h2', {}, 'Ingrese a la portería digital'),
     h('div', { class: 'grupo' }, h('label', { for: 'usuario', class: 'etiqueta' }, 'Usuario'), usuario),
     h('div', { class: 'grupo' }, h('label', { for: 'clave', class: 'etiqueta' }, 'Clave'), clave),
+    captcha,
     h('div', { style: { marginTop: '10px' } }, error),
     boton,
     h('p', { class: 'ayuda', style: { marginTop: '16px' } }, 'Los guardas ingresan con su código. La administración puede usar su código o su correo.'),
@@ -412,10 +510,17 @@ function vistaAcceso(mensaje) {
     error.textContent = '';
     const u = usuario.value.trim();
     if (!u || !clave.value) { error.textContent = 'Escriba su usuario y su clave.'; return; }
+    if (captcha && !captchaToken) { error.textContent = 'Complete la verificación de seguridad antes de ingresar.'; return; }
     const email = u.includes('@') ? u.toLowerCase() : `${u.toLowerCase()}@${CONFIG.DOMINIO_INTERNO}`;
     await conBoton(boton, async () => {
-      const { error: e } = await sb.auth.signInWithPassword({ email, password: clave.value });
-      if (e) { error.textContent = /invalid/i.test(e.message) ? 'Usuario o clave incorrectos.' : e.message; return; }
+      const { error: e } = await sb.auth.signInWithPassword({ email, password: clave.value, options: captchaToken ? { captchaToken } : undefined });
+      reiniciarCaptcha(); // cada verificación sirve para un solo intento
+      if (e) {
+        error.textContent = /invalid/i.test(e.message) ? 'Usuario o clave incorrectos.'
+          : /captcha/i.test(e.message) ? 'La verificación de seguridad no fue válida. Complétela de nuevo.' : e.message;
+        return;
+      }
+      try { localStorage.setItem(CLAVE_ACTIVIDAD, String(Date.now())); } catch { /* sin almacenamiento */ }
       // Solo un ingreso con clave registra este equipo como la sesión activa del guarda
       S.nuevaSesion = true;
       await iniciarSesion();
@@ -539,7 +644,10 @@ async function iniciarSesion() {
   } catch (e) {
     return vistaAcceso('No se pudo cargar la configuración: ' + mensajeError(e));
   }
+  // Sesión recuperada de un uso anterior: si superó el tiempo de inactividad, se cierra
+  if (Date.now() - ultimaActividad() > minutosInactividad() * 60_000) return cerrarPorInactividad();
   montarApp();
+  iniciarInactividad();
   if (perfil.rol === 'guarda') {
     clearInterval(S.vigilancia);
     S.vigilancia = setInterval(verificarSesion, 30000);
@@ -1653,11 +1761,15 @@ function ajustesGeneral(z) {
     anulacion_guarda_min: h('input', { class: 'campo', type: 'number', min: '0', max: '120', value: cfg.anulacion_guarda_min }),
     retencion_dias_visitantes: h('input', { class: 'campo', type: 'number', min: '30', max: '3650', value: cfg.retencion_dias_visitantes }),
     dias_vigencia_clave: h('input', { class: 'campo', type: 'number', min: '30', max: '365', value: cfg.dias_vigencia_clave }),
+    inactividad_min_personal: h('input', { class: 'campo', type: 'number', min: '5', max: '120', value: cfg.inactividad_min_personal }),
+    inactividad_min_guarda: h('input', { class: 'campo', type: 'number', min: '5', max: '240', value: cfg.inactividad_min_guarda }),
   };
   const etiquetas = {
     nombre_conjunto: 'Nombre del conjunto', alerta_permanencia_min: 'Alerta de permanencia (minutos)', qr_minutos_validez: 'Vigencia del QR de pago (minutos)',
     anulacion_guarda_min: 'Minutos que tiene el guarda para anular', retencion_dias_visitantes: 'Retención de fotos de visitantes (días)',
     dias_vigencia_clave: 'Vigencia de las claves del personal (días)',
+    inactividad_min_personal: 'Cierre por inactividad: administración y consejo (minutos)',
+    inactividad_min_guarda: 'Cierre por inactividad: guardas (minutos)',
   };
   const guardar = h('button', { class: 'btn primario' }, 'Guardar cambios');
   const error = h('div', { class: 'error-campo' });
@@ -1669,6 +1781,8 @@ function ajustesGeneral(z) {
       anulacion_guarda_min: Number(campos.anulacion_guarda_min.value),
       retencion_dias_visitantes: Number(campos.retencion_dias_visitantes.value),
       dias_vigencia_clave: Number(campos.dias_vigencia_clave.value),
+      inactividad_min_personal: Number(campos.inactividad_min_personal.value),
+      inactividad_min_guarda: Number(campos.inactividad_min_guarda.value),
     };
     const { data, error: e } = await sb.from('configuracion').update(cambios).eq('id', 1).select().single();
     if (e) { error.textContent = e.message; return; }
@@ -1934,6 +2048,7 @@ setInterval(sincronizarCola, 30000);
 sb.auth.onAuthStateChange((evento) => {
   if (evento === 'SIGNED_OUT') {
     clearInterval(S.vigilancia); S.vigilancia = null;
+    detenerInactividad();
     S.perfil = null; S.turno = null; S.porRecibir = null;
     vistaAcceso(S.motivoSalida ?? undefined);
   }

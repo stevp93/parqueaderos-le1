@@ -10,5 +10,8 @@ export const CONFIG = {
   TORRES: 43,
   PISOS: 6,
   APTOS_POR_PISO: 4,
-  VERSION: '1.3.2',
+  // Clave de sitio (pública) de Cloudflare Turnstile para el ingreso. Vacía = sin captcha.
+  // Activar también en Supabase → Authentication → Attack Protection con la clave secreta.
+  TURNSTILE_SITE_KEY: '',
+  VERSION: '1.4.0',
 };
