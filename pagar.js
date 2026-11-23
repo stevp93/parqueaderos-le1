@@ -44,8 +44,7 @@ function vistaRecibo(d) {
       r.horas_cobradas != null ? [el('dt', {}, 'Liquidación'), el('dd', { class: 'mono' }, `${r.horas_cobradas} h × ${cop(r.tarifa_hora)}`)] : null,
       el('dt', {}, 'Medio de pago'), el('dd', {}, r.metodo ?? 'Electrónico'),
       el('dt', {}, 'Fecha de pago'), el('dd', {}, fecha(r.pagado_en)),
-      el('dt', {}, 'Referencia'), el('dd', { class: 'mono' }, d.referencia),
-      el('dt', {}, 'Huella del registro'), el('dd', { class: 'huella' }, r.huella)),
+      el('dt', {}, 'Referencia'), el('dd', { class: 'mono' }, d.referencia)),
     el('p', { class: 'ayuda', style: 'margin:16px 0 0' }, 'Soporte de pago emitido por el sistema de portería del conjunto. La hora de entrada y la de salida las fija el servidor. Este documento no es una factura electrónica.'),
     el('div', { class: 'acciones' }, imprimir));
 }
