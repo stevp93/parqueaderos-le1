@@ -1,5 +1,5 @@
 // Service worker: la app abre sin conexión; los datos y las fotos nunca se guardan en caché.
-const CACHE = 'le1-porteria-v5';
+const CACHE = 'le1-porteria-v6';
 const BASE = ['./', './index.html', './estilos.css', './app.js', './config.js', './manifest.webmanifest', './icono.svg', './icono-192.png', './icono-512.png',
   './icono-maskable-512.png', './icono-apple-180.png', './marca/spa-monograma-negativo.svg', './marca/spa-logo-negativo.svg'];
 

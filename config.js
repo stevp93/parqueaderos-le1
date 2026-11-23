@@ -10,5 +10,5 @@ export const CONFIG = {
   TORRES: 43,
   PISOS: 6,
   APTOS_POR_PISO: 4,
-  VERSION: '1.3.0',
+  VERSION: '1.3.1',
 };

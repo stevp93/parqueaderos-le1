@@ -1693,7 +1693,8 @@ function ajustesWhatsapp() {
   const cfg = S.cfg;
   const modo = h('select', { class: 'campo', id: 'wa-modo' }, h('option', { value: 'activo' }, 'Activo'), h('option', { value: 'desactivado' }, 'Desactivado'));
   modo.value = cfg.whatsapp_modo;
-  const prueba = h('input', { class: 'campo mono', id: 'wa-prueba', type: 'tel', inputmode: 'numeric', maxlength: '16', placeholder: 'Vacío = al visitante', value: cfg.whatsapp_numero_prueba ? celularVisible(cfg.whatsapp_numero_prueba) : '' });
+  const prueba = h('input', { class: 'campo mono', id: 'wa-prueba', inputmode: 'numeric', maxlength: '80', placeholder: 'Vacío = envío a todos los visitantes',
+    value: (cfg.whatsapp_numeros_prueba ?? []).map(celularVisible).join(', ') });
   const dias = h('input', { class: 'campo', id: 'wa-dias', type: 'number', min: '1', max: '60', value: cfg.deuda_dias_enlace });
   const error = h('div', { class: 'error-campo' });
   const estado = h('div', { class: 'lista-simple', style: { margin: '10px 0' } });
@@ -1708,19 +1709,20 @@ function ajustesWhatsapp() {
       h('div', {}, h('span', {}, 'En cola'), h('span', { class: 'chip azul' }, String(n('pendiente') + n('enviando')))),
       h('div', {}, h('span', {}, 'Fallidos'), h('span', { class: 'chip ' + (n('error') ? 'rojo' : '') }, String(n('error')))),
       sinConfigurar ? h('div', {}, h('span', { class: 'mudo' }, 'La conexión con Evolution API aún no está configurada en el servidor.'), h('span', { class: 'chip ambar' }, 'Pendiente')) : null,
+      (S.cfg.whatsapp_numeros_prueba ?? []).length ? h('div', {}, h('span', {}, 'Modo pruebas'), h('span', { class: 'chip ambar' }, `${S.cfg.whatsapp_numeros_prueba.length} números`)) : null,
     );
   }
-  prueba.addEventListener('input', () => formatearCelular(prueba));
   guardar.onclick = () => conBoton(guardar, async () => {
     error.textContent = '';
-    const numero = normalizarCelular(prueba.value);
-    if (numero && !CELULAR.test(numero)) { error.textContent = 'El número de pruebas debe tener 10 dígitos y empezar por 3.'; return; }
+    const numeros = [...new Set(prueba.value.split(/[,;\n]+/).map(normalizarCelular).filter(Boolean))];
+    if (numeros.some((x) => !CELULAR.test(x))) { error.textContent = 'Cada número de pruebas debe tener 10 dígitos y empezar por 3; sepárelos con comas.'; return; }
+    if (numeros.length > 5) { error.textContent = 'Máximo 5 números de pruebas.'; return; }
     const d = Number(dias.value);
     if (!(d >= 1 && d <= 60)) { error.textContent = 'Los días del enlace de deuda van de 1 a 60.'; return; }
     const { data, error: e } = await sb.from('configuracion')
-      .update({ whatsapp_modo: modo.value, whatsapp_numero_prueba: numero || null, deuda_dias_enlace: d }).eq('id', 1).select().single();
+      .update({ whatsapp_modo: modo.value, whatsapp_numeros_prueba: numeros, deuda_dias_enlace: d }).eq('id', 1).select().single();
     if (e) { error.textContent = e.message; return; }
-    S.cfg = data; aviso('Configuración de WhatsApp guardada');
+    S.cfg = data; prueba.value = numeros.map(celularVisible).join(', '); aviso('Configuración de WhatsApp guardada');
   });
   reintentar.onclick = () => conBoton(reintentar, async () => {
     try {
@@ -1734,7 +1736,8 @@ function ajustesWhatsapp() {
     h('p', { class: 'mudo' }, 'Al visitante le llegan el enlace de pago, el recibo (hora de entrada, salida, tiempo y valor) y, si se fue sin pagar, el recordatorio de la deuda. Los mensajes salen por Evolution API.'),
     estado,
     h('div', { class: 'grupo' }, h('label', { class: 'etiqueta', for: 'wa-modo' }, 'Envío'), modo),
-    h('div', { class: 'grupo' }, h('label', { class: 'etiqueta', for: 'wa-prueba' }, 'Número de pruebas (recibe todos los mensajes)'), prueba),
+    h('div', { class: 'grupo' }, h('label', { class: 'etiqueta', for: 'wa-prueba' }, 'Números de prueba (separados por comas)'), prueba,
+      h('p', { class: 'ayuda', style: { margin: '6px 0 0' } }, 'Mientras haya números aquí, solo se envían mensajes a esos celulares; a cualquier otro número no se envía nada. Vacíe el campo para pasar a operación.')),
     h('div', { class: 'grupo' }, h('label', { class: 'etiqueta', for: 'wa-dias' }, 'Vigencia del enlace de deuda (días)'), dias),
     error, h('div', { class: 'fila', style: { marginTop: '12px' } }, guardar, reintentar));
 }
