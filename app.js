@@ -482,16 +482,16 @@ function vistaAcceso(mensaje) {
   const clave = h('input', { class: 'campo', id: 'clave', type: 'password', autocomplete: 'current-password', required: true });
   const boton = h('button', { class: 'btn primario grande bloque', type: 'submit' }, 'Ingresar');
   const captcha = CONFIG.TURNSTILE_SITE_KEY ? h('div', { class: 'captcha', 'aria-label': 'Verificación de seguridad' }) : null;
-  let captchaToken = null; let captchaId = null;
+  let captchaToken = null; let captchaId = null; let captchaFallo = false;
   if (captcha) {
     cargarTurnstile().then((ts) => {
       captchaId = ts.render(captcha, {
         sitekey: CONFIG.TURNSTILE_SITE_KEY, language: 'es', theme: 'dark', size: 'flexible', action: 'ingreso',
         callback: (t) => { captchaToken = t; if (/verificaci/i.test(error.textContent)) error.textContent = ''; },
         'expired-callback': () => { captchaToken = null; },
-        'error-callback': () => { captchaToken = null; error.textContent = 'La verificación de seguridad falló. Recargue la página e intente de nuevo.'; },
+        'error-callback': () => { captchaToken = null; captchaFallo = true; },
       });
-    }).catch((e) => { error.textContent = e.message; });
+    }).catch(() => { captchaFallo = true; });
   }
   const reiniciarCaptcha = () => { captchaToken = null; if (captchaId !== null) try { window.turnstile.reset(captchaId); } catch { /* sin widget */ } };
   const form = h('form', { class: 'acceso-caja', novalidate: true },
@@ -510,14 +510,15 @@ function vistaAcceso(mensaje) {
     error.textContent = '';
     const u = usuario.value.trim();
     if (!u || !clave.value) { error.textContent = 'Escriba su usuario y su clave.'; return; }
-    if (captcha && !captchaToken) { error.textContent = 'Complete la verificación de seguridad antes de ingresar.'; return; }
+    // Quien exige el captcha es Supabase Auth: si el widget no carga y la protección está apagada, se puede ingresar
+    if (captcha && !captchaToken && captchaId !== null && !captchaFallo) { error.textContent = 'Marque la casilla de verificación de seguridad antes de ingresar.'; return; }
     const email = u.includes('@') ? u.toLowerCase() : `${u.toLowerCase()}@${CONFIG.DOMINIO_INTERNO}`;
     await conBoton(boton, async () => {
       const { error: e } = await sb.auth.signInWithPassword({ email, password: clave.value, options: captchaToken ? { captchaToken } : undefined });
       reiniciarCaptcha(); // cada verificación sirve para un solo intento
       if (e) {
         error.textContent = /invalid/i.test(e.message) ? 'Usuario o clave incorrectos.'
-          : /captcha/i.test(e.message) ? 'La verificación de seguridad no fue válida. Complétela de nuevo.' : e.message;
+          : /captcha/i.test(e.message) ? 'La verificación de seguridad no fue válida o no cargó. Márquela de nuevo; si no aparece, recargue la página.' : e.message;
         return;
       }
       try { localStorage.setItem(CLAVE_ACTIVIDAD, String(Date.now())); } catch { /* sin almacenamiento */ }
